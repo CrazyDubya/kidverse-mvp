@@ -84,25 +84,41 @@ const connectDB = async () => {
 // ============================================
 
 const authenticateToken = (req, res, next) => {
+  // SECURITY: Ensure JWT_SECRET is configured in production
+  if (!process.env.JWT_SECRET) {
+    console.error('CRITICAL SECURITY ERROR: JWT_SECRET environment variable is not set!');
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(500).json({
+        success: false,
+        message: 'Server configuration error'
+      });
+    }
+  }
+
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
   if (!token) {
-    return res.status(401).json({ 
-      success: false, 
-      message: 'Access token required' 
+    return res.status(401).json({
+      success: false,
+      message: 'Access token required'
     });
   }
 
   try {
     const jwt = require('jsonwebtoken');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production');
+    // SECURITY FIX: Require JWT_SECRET, no fallback in production
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      throw new Error('JWT_SECRET not configured');
+    }
+    const decoded = jwt.verify(token, secret);
     req.user = decoded;
     next();
   } catch (error) {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Invalid or expired token' 
+    return res.status(403).json({
+      success: false,
+      message: 'Invalid or expired token'
     });
   }
 };
@@ -112,15 +128,18 @@ const optionalAuth = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (token) {
+  if (token && process.env.JWT_SECRET) {
     try {
       const jwt = require('jsonwebtoken');
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production');
+      // SECURITY FIX: Only verify if JWT_SECRET is configured
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       req.user = decoded;
     } catch (error) {
       // Token invalid but we don't fail the request
       req.user = null;
     }
+  } else {
+    req.user = null;
   }
   next();
 };
@@ -130,45 +149,102 @@ const optionalAuth = (req, res, next) => {
 // ============================================
 
 const activeUsers = new Map();
+const jwt = require('jsonwebtoken');
+
+// SECURITY FIX: Socket.IO authentication middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
+
+  if (!token) {
+    return next(new Error('Authentication required'));
+  }
+
+  if (!process.env.JWT_SECRET) {
+    console.error('CRITICAL: JWT_SECRET not configured for Socket.IO');
+    return next(new Error('Server configuration error'));
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.user = decoded;  // Attach verified user data to socket
+    next();
+  } catch (error) {
+    return next(new Error('Invalid authentication token'));
+  }
+});
 
 io.on('connection', (socket) => {
-  console.log(`🔌 New client connected: ${socket.id}`);
+  // SECURITY: User data comes from verified JWT, not client input
+  const user = socket.user;
+  console.log(`🔌 Authenticated client connected: ${socket.id} (User: ${user.userId})`);
 
-  // User joins
-  socket.on('user:join', (userData) => {
-    activeUsers.set(socket.id, userData);
-    socket.broadcast.emit('user:online', userData);
-    console.log(`👤 User joined: ${userData.username}`);
+  // Store authenticated user
+  activeUsers.set(socket.id, {
+    id: user.userId,
+    username: user.username || user.email,
+    role: user.role
+  });
+  socket.broadcast.emit('user:online', {
+    id: user.userId,
+    username: user.username || user.email,
+    role: user.role
   });
 
-  // Handle chat messages
+  // Handle chat messages - SECURITY: Include verified sender info + sanitize message
   socket.on('chat:message', (data) => {
+    // Validate and sanitize message
+    if (!data || typeof data.message !== 'string') {
+      socket.emit('error', { message: 'Invalid message format' });
+      return;
+    }
+
+    // Sanitize message - remove HTML/script tags and limit length
+    const sanitizedMessage = data.message
+      .replace(/<[^>]*>/g, '')  // Strip HTML tags
+      .substring(0, 1000)        // Limit length
+      .trim();
+
+    if (!sanitizedMessage) {
+      socket.emit('error', { message: 'Message cannot be empty' });
+      return;
+    }
+
     io.emit('chat:message', {
-      ...data,
+      message: sanitizedMessage,
+      senderId: user.userId,  // From JWT, not user input
+      senderName: user.username || user.email,
       timestamp: new Date().toISOString()
     });
   });
 
-  // Handle game events
+  // Handle game events - SECURITY: Validate and use verified user data
   socket.on('game:join', (gameData) => {
+    if (!gameData.roomId || typeof gameData.roomId !== 'string') {
+      socket.emit('error', { message: 'Invalid room ID' });
+      return;
+    }
     socket.join(gameData.roomId);
     io.to(gameData.roomId).emit('game:player-joined', {
-      userId: gameData.userId,
-      username: gameData.username
+      userId: user.userId,  // From JWT
+      username: user.username || user.email
     });
   });
 
   socket.on('game:action', (actionData) => {
-    socket.to(actionData.roomId).emit('game:action', actionData);
+    if (!actionData.roomId) return;
+    socket.to(actionData.roomId).emit('game:action', {
+      ...actionData,
+      userId: user.userId  // Ensure userId is from JWT
+    });
   });
 
   // User disconnects
   socket.on('disconnect', () => {
-    const user = activeUsers.get(socket.id);
-    if (user) {
-      socket.broadcast.emit('user:offline', user);
+    const userData = activeUsers.get(socket.id);
+    if (userData) {
+      socket.broadcast.emit('user:offline', userData);
       activeUsers.delete(socket.id);
-      console.log(`👤 User disconnected: ${user.username}`);
+      console.log(`👤 User disconnected: ${userData.username}`);
     }
     console.log(`🔌 Client disconnected: ${socket.id}`);
   });
@@ -227,7 +303,14 @@ app.use('/api/auth', (req, res) => {
 });
 
 app.use('/api/users', authenticateToken, (req, res) => {
-  res.status(200).json({ message: 'User routes - authenticated', user: req.user });
+  // SECURITY FIX: Don't expose full user object, only safe fields
+  res.status(200).json({
+    message: 'User routes - authenticated',
+    user: {
+      id: req.user.userId,
+      role: req.user.role
+    }
+  });
 });
 
 app.use('/api/games', authenticateToken, (req, res) => {
@@ -257,6 +340,7 @@ app.use((req, res, next) => {
 
 // Global error handler
 app.use((err, req, res, next) => {
+  // Log error details server-side only
   console.error('❌ Error:', err);
 
   // Mongoose validation error
@@ -269,35 +353,32 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Mongoose duplicate key error
+  // Mongoose duplicate key error - SECURITY: Don't reveal field names in production
   if (err.code === 11000) {
-    const field = Object.keys(err.keyPattern)[0];
     return res.status(400).json({
       success: false,
-      message: `${field} already exists`
+      message: process.env.NODE_ENV === 'development'
+        ? `${Object.keys(err.keyPattern)[0]} already exists`
+        : 'A record with this value already exists'
     });
   }
 
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
+  // JWT errors - SECURITY: Generic messages to prevent enumeration
+  if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
     return res.status(401).json({
       success: false,
-      message: 'Invalid token'
+      message: 'Authentication failed'
     });
   }
 
-  if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({
-      success: false,
-      message: 'Token expired'
-    });
-  }
-
-  // Default error
+  // SECURITY FIX: Never expose internal error details to clients
+  // Default error response - generic message for production
+  const isDev = process.env.NODE_ENV === 'development';
   res.status(err.status || 500).json({
     success: false,
-    message: err.message || 'Internal server error',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    message: isDev ? err.message : 'An error occurred processing your request',
+    // Only include error ID for tracking, never stack traces
+    errorId: Date.now().toString(36) + Math.random().toString(36).substr(2, 9)
   });
 });
 
