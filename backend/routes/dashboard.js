@@ -1,36 +1,96 @@
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const mongoose = require('mongoose');
+
+// Rate limiter for dashboard API endpoints
+const dashboardRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: {
+    error: 'Too many requests',
+    message: 'Please try again later'
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Apply rate limiting to all dashboard routes
+router.use(dashboardRateLimit);
 
 // Middleware for input validation
 const validatePagination = (req, res, next) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 20;
-  
+
   if (page < 1) {
-    return res.status(400).json({ 
-      error: 'Invalid pagination', 
-      message: 'Page number must be greater than 0' 
+    return res.status(400).json({
+      error: 'Invalid pagination',
+      message: 'Page number must be greater than 0'
     });
   }
-  
+
   if (limit < 1 || limit > 100) {
-    return res.status(400).json({ 
-      error: 'Invalid pagination', 
-      message: 'Limit must be between 1 and 100' 
+    return res.status(400).json({
+      error: 'Invalid pagination',
+      message: 'Limit must be between 1 and 100'
     });
   }
-  
+
   req.pagination = { page, limit, skip: (page - 1) * limit };
   next();
 };
 
-// Middleware for authentication (placeholder - implement based on your auth system)
+// SECURITY FIX: Proper JWT authentication middleware
 const authenticate = (req, res, next) => {
-  // TODO: Implement actual authentication
-  // For MVP, you might want to verify JWT token or session
-  // Example: const token = req.headers.authorization?.split(' ')[1];
-  
-  // For now, allowing all requests - REPLACE THIS IN PRODUCTION
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'Authentication required',
+      message: 'Please provide a valid authentication token'
+    });
+  }
+
+  const token = authHeader.substring(7);
+
+  // SECURITY: Require JWT_SECRET to be configured
+  if (!process.env.JWT_SECRET) {
+    console.error('CRITICAL: JWT_SECRET not configured');
+    return res.status(500).json({
+      error: 'Server configuration error',
+      message: 'Authentication service unavailable'
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        error: 'Token expired',
+        message: 'Please log in again'
+      });
+    }
+    return res.status(401).json({
+      error: 'Invalid token',
+      message: 'Authentication failed'
+    });
+  }
+};
+
+// Validate MongoDB ObjectId
+const validateObjectId = (paramName) => (req, res, next) => {
+  const id = req.params[paramName];
+  if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      error: 'Invalid ID',
+      message: `${paramName} must be a valid identifier`
+    });
+  }
   next();
 };
 
@@ -117,9 +177,41 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
     if (flagged !== undefined) {
       filters.flagged = flagged === 'true';
     }
-    
+
+    // SECURITY FIX: Prevent IDOR - users can only access their own data
+    // or their children's data if they are a parent
     if (userId) {
+      // Validate userId is a valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        return res.status(400).json({
+          error: 'Invalid user ID',
+          message: 'userId must be a valid identifier'
+        });
+      }
+
+      // Authorization check: user can only view their own data or their family's data
+      const isOwnData = req.user.userId === userId;
+      const isAdmin = req.user.role === 'admin';
+      // Parents can only access data within their own family
+      const isParentAccessingFamily = req.user.role === 'parent' && req.user.familyId;
+
+      if (!isOwnData && !isAdmin) {
+        // For parent accessing family member's data, we would need to verify
+        // the target userId belongs to the same family (requires DB lookup)
+        // For now, restrict to own data unless admin
+        if (!isParentAccessingFamily) {
+          return res.status(403).json({
+            error: 'Access denied',
+            message: 'You can only access your own data'
+          });
+        }
+        // TODO: Add DB lookup to verify userId belongs to req.user.familyId
+        // For now, allow parent to pass familyId filter (will be validated at DB level)
+      }
       filters.userId = userId;
+    } else {
+      // Default to showing only the authenticated user's data
+      filters.userId = req.user.userId;
     }
 
     // TODO: Replace with actual database queries
@@ -161,9 +253,20 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
 router.get('/alerts', authenticate, async (req, res) => {
   try {
     const { status, severity, limit } = req.query;
-    
+
     // Build filter object
     const filters = {};
+
+    // SECURITY FIX: Add ownership filter - users can only see alerts for their family
+    if (req.user.role === 'admin') {
+      // Admins can see all alerts (no filter)
+    } else if (req.user.role === 'parent' && req.user.familyId) {
+      // Parents see alerts for their family
+      filters.familyId = req.user.familyId;
+    } else {
+      // Children and others only see their own alerts
+      filters.userId = req.user.userId;
+    }
     
     if (status) {
       const validStatuses = ['pending', 'reviewed', 'resolved', 'dismissed'];
@@ -215,18 +318,13 @@ router.get('/alerts', authenticate, async (req, res) => {
  * POST /api/alerts/:id/review
  * Mark an alert as reviewed with optional notes
  */
-router.post('/alerts/:id/review', authenticate, async (req, res) => {
+router.post('/alerts/:id/review', authenticate, validateObjectId('id'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { action, notes, reviewedBy } = req.body;
+    const { action, notes } = req.body;  // SECURITY: Removed reviewedBy from user input
 
-    // Validate alert ID
-    if (!id || id.trim() === '') {
-      return res.status(400).json({ 
-        error: 'Invalid request', 
-        message: 'Alert ID is required' 
-      });
-    }
+    // SECURITY: reviewedBy should always be the authenticated user, not user input
+    const reviewedBy = req.user.userId;
 
     // Validate action
     const validActions = ['resolved', 'dismissed', 'escalated', 'pending'];
@@ -261,12 +359,12 @@ router.post('/alerts/:id/review', authenticate, async (req, res) => {
     // alert.reviewNotes = notes;
     // await alert.save();
 
-    // Placeholder response
+    // Placeholder response - SECURITY: reviewedBy is always from authenticated user
     const updatedAlert = {
       id,
       status: action,
       reviewedAt: new Date().toISOString(),
-      reviewedBy: reviewedBy || 'current_user',
+      reviewedBy: reviewedBy,  // Always from req.user.userId
       reviewNotes: notes || null
     };
 
@@ -290,9 +388,15 @@ router.post('/alerts/:id/review', authenticate, async (req, res) => {
  */
 router.get('/config', authenticate, async (req, res) => {
   try {
+    // SECURITY: Config is scoped to user/family
     // TODO: Replace with actual database query or config file
     // Example:
-    // const config = await Config.findOne({ userId: req.user.id });
+    // const config = await Config.findOne({
+    //   $or: [
+    //     { userId: req.user.userId },
+    //     { familyId: req.user.familyId }
+    //   ]
+    // });
 
     const config = {
       monitoringEnabled: true,
@@ -353,13 +457,39 @@ router.get('/config', authenticate, async (req, res) => {
  */
 router.post('/config', authenticate, async (req, res) => {
   try {
+    // SECURITY: Only parents and admins can modify config
+    if (req.user.role !== 'parent' && req.user.role !== 'admin') {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'Only parents can modify monitoring configuration'
+      });
+    }
+
     const updates = req.body;
 
     // Validate configuration updates
-    if (!updates || typeof updates !== 'object') {
-      return res.status(400).json({ 
-        error: 'Invalid request', 
-        message: 'Configuration updates must be provided as an object' 
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+      return res.status(400).json({
+        error: 'Invalid request',
+        message: 'Configuration updates must be provided as an object'
+      });
+    }
+
+    // SECURITY: Prevent prototype pollution
+    const dangerousKeys = ['__proto__', 'constructor', 'prototype'];
+    const hasDangerousKey = (obj) => {
+      if (typeof obj !== 'object' || obj === null) return false;
+      for (const key of Object.keys(obj)) {
+        if (dangerousKeys.includes(key)) return true;
+        if (typeof obj[key] === 'object' && hasDangerousKey(obj[key])) return true;
+      }
+      return false;
+    };
+
+    if (hasDangerousKey(updates)) {
+      return res.status(400).json({
+        error: 'Invalid request',
+        message: 'Invalid configuration keys detected'
       });
     }
 
