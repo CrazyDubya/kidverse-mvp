@@ -65,7 +65,7 @@ const authenticate = (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     req.user = decoded;
     next();
   } catch (error) {
@@ -146,6 +146,9 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
   try {
     const { page, limit, skip } = req.pagination;
     const { startDate, endDate, flagged, userId } = req.query;
+    if ([startDate, endDate, flagged, userId].some(v => v !== undefined && typeof v !== 'string')) {
+      return res.status(400).json({ error: 'Invalid query', message: 'Query parameters must be strings' });
+    }
 
     // Build filter object
     const filters = {};
@@ -189,24 +192,16 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
         });
       }
 
-      // Authorization check: user can only view their own data or their family's data
+      // Authorization: own data, or admin. Parent access to a child's data requires
+      // verifying family membership against the User model, which does not exist yet,
+      // so it is denied (fail closed) until that lookup is implemented.
       const isOwnData = req.user.userId === userId;
       const isAdmin = req.user.role === 'admin';
-      // Parents can only access data within their own family
-      const isParentAccessingFamily = req.user.role === 'parent' && req.user.familyId;
-
       if (!isOwnData && !isAdmin) {
-        // For parent accessing family member's data, we would need to verify
-        // the target userId belongs to the same family (requires DB lookup)
-        // For now, restrict to own data unless admin
-        if (!isParentAccessingFamily) {
-          return res.status(403).json({
-            error: 'Access denied',
-            message: 'You can only access your own data'
-          });
-        }
-        // TODO: Add DB lookup to verify userId belongs to req.user.familyId
-        // For now, allow parent to pass familyId filter (will be validated at DB level)
+        return res.status(403).json({
+          error: 'Access denied',
+          message: 'You can only access your own data'
+        });
       }
       filters.userId = userId;
     } else {
@@ -235,7 +230,6 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
         hasNext: page * limit < total,
         hasPrev: page > 1
       },
-      filters: filters
     });
   } catch (error) {
     console.error('Error fetching interactions:', error);
@@ -253,6 +247,9 @@ router.get('/interactions', authenticate, validatePagination, async (req, res) =
 router.get('/alerts', authenticate, async (req, res) => {
   try {
     const { status, severity, limit } = req.query;
+    if ([status, severity, limit].some(v => v !== undefined && typeof v !== 'string')) {
+      return res.status(400).json({ error: 'Invalid query', message: 'Query parameters must be strings' });
+    }
 
     // Build filter object
     const filters = {};
@@ -290,7 +287,8 @@ router.get('/alerts', authenticate, async (req, res) => {
       filters.severity = severity;
     }
 
-    const queryLimit = limit ? Math.min(parseInt(limit), 100) : 50;
+    const parsedLimit = parseInt(limit, 10);
+    const queryLimit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 50;
 
     // TODO: Replace with actual database queries
     // Example:
@@ -341,6 +339,10 @@ router.post('/alerts/:id/review', authenticate, validateObjectId('id'), async (r
         error: 'Invalid notes', 
         message: 'Notes must be a string' 
       });
+    }
+
+    if (typeof notes === 'string' && notes.length > 1000) {
+      return res.status(400).json({ error: 'Invalid notes', message: 'Notes must be 1000 characters or fewer' });
     }
 
     // TODO: Replace with actual database update
@@ -610,8 +612,15 @@ router.post('/config', authenticate, async (req, res) => {
     //   { new: true, upsert: true }
     // );
 
+    // Whitelist known top-level keys; ignore anything else the client sent
+    const allowedKeys = ['monitoringEnabled', 'alertThresholds', 'notifications', 'contentFilters', 'dataRetention'];
+    const sanitizedUpdates = {};
+    for (const key of allowedKeys) {
+      if (updates[key] !== undefined) sanitizedUpdates[key] = updates[key];
+    }
+
     const updatedConfig = {
-      ...updates,
+      ...sanitizedUpdates,
       lastUpdated: new Date().toISOString()
     };
 
@@ -633,7 +642,7 @@ router.post('/config', authenticate, async (req, res) => {
 router.use((err, req, res, next) => {
   console.error('Dashboard route error:', err);
   res.status(err.status || 500).json({
-    error: err.message || 'Internal server error',
+    error: 'Internal server error',
     message: 'An error occurred processing your request'
   });
 });

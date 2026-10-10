@@ -6,9 +6,12 @@ const morgan = require('morgan');
 const http = require('http');
 const socketIO = require('socket.io');
 const dotenv = require('dotenv');
+const jwt = require('jsonwebtoken');
 
 // Load environment variables
 dotenv.config();
+
+const dashboardRoutes = require('./routes/dashboard');
 
 // Initialize Express app
 const app = express();
@@ -39,8 +42,8 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // Body parser middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
 // HTTP request logger
 if (process.env.NODE_ENV === 'development') {
@@ -57,10 +60,7 @@ const connectDB = async () => {
   try {
     const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/kidverse';
     
-    await mongoose.connect(mongoURI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+    await mongoose.connect(mongoURI);
     
     console.log('✅ MongoDB connected successfully');
     
@@ -83,62 +83,50 @@ const connectDB = async () => {
 // AUTHENTICATION MIDDLEWARE
 // ============================================
 
-const authenticateToken = (req, res, next) => {
-  // SECURITY: Ensure JWT_SECRET is configured in production
-  if (!process.env.JWT_SECRET) {
-    console.error('CRITICAL SECURITY ERROR: JWT_SECRET environment variable is not set!');
-    if (process.env.NODE_ENV === 'production') {
-      return res.status(500).json({
-        success: false,
-        message: 'Server configuration error'
-      });
-    }
+const JWT_SECRET = process.env.JWT_SECRET;
+const MIN_SECRET_LENGTH = 32;
+
+// Fail fast: never run with a missing/weak signing secret outside of tests
+if (process.env.NODE_ENV !== 'test') {
+  if (!JWT_SECRET) {
+    console.error('❌ JWT_SECRET is not set. Refusing to start.');
+    process.exit(1);
   }
+  if (process.env.NODE_ENV === 'production' && JWT_SECRET.length < MIN_SECRET_LENGTH) {
+    console.error(`❌ JWT_SECRET must be at least ${MIN_SECRET_LENGTH} characters in production.`);
+    process.exit(1);
+  }
+}
 
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+// Pin the algorithm to prevent algorithm-confusion attacks
+const verifyToken = (token) => jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
 
+const extractBearer = (header) => {
+  if (typeof header !== 'string') return null;
+  const [scheme, token] = header.split(' ');
+  return scheme === 'Bearer' && token ? token : null;
+};
+
+const authenticateToken = (req, res, next) => {
+  const token = extractBearer(req.headers.authorization);
   if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: 'Access token required'
-    });
+    return res.status(401).json({ success: false, message: 'Access token required' });
   }
 
   try {
-    const jwt = require('jsonwebtoken');
-    // SECURITY FIX: Require JWT_SECRET, no fallback in production
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-      throw new Error('JWT_SECRET not configured');
-    }
-    const decoded = jwt.verify(token, secret);
-    req.user = decoded;
+    req.user = verifyToken(token);
     next();
   } catch (error) {
-    return res.status(403).json({
-      success: false,
-      message: 'Invalid or expired token'
-    });
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
   }
 };
 
 // Optional authentication (doesn't fail if no token)
 const optionalAuth = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (token && process.env.JWT_SECRET) {
-    try {
-      const jwt = require('jsonwebtoken');
-      // SECURITY FIX: Only verify if JWT_SECRET is configured
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = decoded;
-    } catch (error) {
-      // Token invalid but we don't fail the request
-      req.user = null;
-    }
-  } else {
+  const token = extractBearer(req.headers.authorization);
+  try {
+    req.user = token ? verifyToken(token) : null;
+  } catch (error) {
     req.user = null;
   }
   next();
@@ -149,24 +137,33 @@ const optionalAuth = (req, res, next) => {
 // ============================================
 
 const activeUsers = new Map();
-const jwt = require('jsonwebtoken');
 
-// SECURITY FIX: Socket.IO authentication middleware
+const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_MESSAGE_LENGTH = 1000;
+const CHAT_WINDOW_MS = 10 * 1000;
+const CHAT_MAX_PER_WINDOW = 20;
+
+// Escape on output rather than trying to strip markup with a regex
+const escapeHtml = (str) =>
+  str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
 io.use((socket, next) => {
-  const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
-
+  const token = socket.handshake.auth?.token || extractBearer(socket.handshake.headers.authorization);
   if (!token) {
     return next(new Error('Authentication required'));
   }
 
-  if (!process.env.JWT_SECRET) {
-    console.error('CRITICAL: JWT_SECRET not configured for Socket.IO');
-    return next(new Error('Server configuration error'));
-  }
-
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.user = decoded;  // Attach verified user data to socket
+    const decoded = verifyToken(token);
+    if (!decoded.userId) {
+      return next(new Error('Invalid authentication token'));
+    }
+    socket.user = decoded;
     next();
   } catch (error) {
     return next(new Error('Invalid authentication token'));
@@ -174,79 +171,87 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  // SECURITY: User data comes from verified JWT, not client input
   const user = socket.user;
-  console.log(`🔌 Authenticated client connected: ${socket.id} (User: ${user.userId})`);
+  const displayName = user.username || user.email || 'user';
+  const publicUser = { id: user.userId, username: displayName, role: user.role };
 
-  // Store authenticated user
-  activeUsers.set(socket.id, {
-    id: user.userId,
-    username: user.username || user.email,
-    role: user.role
-  });
-  socket.broadcast.emit('user:online', {
-    id: user.userId,
-    username: user.username || user.email,
-    role: user.role
-  });
+  // Every user lives in a private scope: their family room, or a personal room.
+  // Nothing is ever broadcast globally, so users can't see other families' traffic.
+  const scope = user.familyId ? `family_${user.familyId}` : `user_${user.userId}`;
+  socket.join(scope);
 
-  // Handle chat messages - SECURITY: Include verified sender info + sanitize message
+  activeUsers.set(socket.id, publicUser);
+  socket.to(scope).emit('user:online', publicUser);
+
+  // Simple per-socket chat flood control
+  let windowStart = Date.now();
+  let sentInWindow = 0;
+
   socket.on('chat:message', (data) => {
-    // Validate and sanitize message
     if (!data || typeof data.message !== 'string') {
       socket.emit('error', { message: 'Invalid message format' });
       return;
     }
 
-    // Sanitize message - remove HTML/script tags and limit length
-    const sanitizedMessage = data.message
-      .replace(/<[^>]*>/g, '')  // Strip HTML tags
-      .substring(0, 1000)        // Limit length
-      .trim();
+    const now = Date.now();
+    if (now - windowStart > CHAT_WINDOW_MS) {
+      windowStart = now;
+      sentInWindow = 0;
+    }
+    if (++sentInWindow > CHAT_MAX_PER_WINDOW) {
+      socket.emit('error', { message: 'You are sending messages too quickly' });
+      return;
+    }
 
-    if (!sanitizedMessage) {
+    const message = data.message.trim().substring(0, MAX_MESSAGE_LENGTH);
+    if (!message) {
       socket.emit('error', { message: 'Message cannot be empty' });
       return;
     }
 
-    io.emit('chat:message', {
-      message: sanitizedMessage,
-      senderId: user.userId,  // From JWT, not user input
-      senderName: user.username || user.email,
+    io.to(scope).emit('chat:message', {
+      message: escapeHtml(message),
+      senderId: user.userId,
+      senderName: escapeHtml(String(displayName)),
       timestamp: new Date().toISOString()
     });
   });
 
-  // Handle game events - SECURITY: Validate and use verified user data
   socket.on('game:join', (gameData) => {
-    if (!gameData.roomId || typeof gameData.roomId !== 'string') {
+    const roomId = gameData && gameData.roomId;
+    if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
       socket.emit('error', { message: 'Invalid room ID' });
       return;
     }
-    socket.join(gameData.roomId);
-    io.to(gameData.roomId).emit('game:player-joined', {
-      userId: user.userId,  // From JWT
-      username: user.username || user.email
+    // Namespaced so clients can't join internal family_/user_ rooms by name
+    const room = `game_${roomId}`;
+    socket.join(room);
+    io.to(room).emit('game:player-joined', {
+      userId: user.userId,
+      username: displayName
     });
   });
 
   socket.on('game:action', (actionData) => {
-    if (!actionData.roomId) return;
-    socket.to(actionData.roomId).emit('game:action', {
-      ...actionData,
-      userId: user.userId  // Ensure userId is from JWT
+    const roomId = actionData && actionData.roomId;
+    if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) return;
+    const room = `game_${roomId}`;
+    // Only members can emit into a room
+    if (!socket.rooms.has(room)) return;
+    socket.to(room).emit('game:action', {
+      action: actionData.action,
+      payload: actionData.payload,
+      roomId,
+      userId: user.userId
     });
   });
 
-  // User disconnects
   socket.on('disconnect', () => {
     const userData = activeUsers.get(socket.id);
     if (userData) {
-      socket.broadcast.emit('user:offline', userData);
+      socket.to(scope).emit('user:offline', userData);
       activeUsers.delete(socket.id);
-      console.log(`👤 User disconnected: ${userData.username}`);
     }
-    console.log(`🔌 Client disconnected: ${socket.id}`);
   });
 });
 
@@ -317,13 +322,16 @@ app.use('/api/games', authenticateToken, (req, res) => {
   res.status(200).json({ message: 'Game routes - to be implemented' });
 });
 
-app.use('/api/content', (req, res) => {
+app.use('/api/content', optionalAuth, (req, res) => {
   res.status(200).json({ message: 'Content routes - to be implemented' });
 });
 
 app.use('/api/parents', authenticateToken, (req, res) => {
   res.status(200).json({ message: 'Parent routes - to be implemented' });
 });
+
+// Dashboard routes (status, interactions, alerts, config) - each route enforces its own auth
+app.use('/api', dashboardRoutes);
 
 // ============================================
 // ERROR HANDLING
