@@ -49,20 +49,14 @@ class DatabaseConfig {
       retryWrites: true,
       retryReads: true,
       
-      // Buffer settings
-      bufferMaxEntries: 0,
-      bufferCommands: false,
-      
       // Authentication
       authSource: process.env.DB_AUTH_SOURCE || 'admin',
       
       // SSL/TLS settings for production
       ...(process.env.NODE_ENV === 'production' && {
-        ssl: true,
-        sslValidate: true,
-        sslCA: process.env.DB_SSL_CA,
-        sslCert: process.env.DB_SSL_CERT,
-        sslKey: process.env.DB_SSL_KEY
+        tls: true,
+        tlsCAFile: process.env.DB_SSL_CA,
+        tlsCertificateKeyFile: process.env.DB_SSL_KEY
       })
     };
   }
@@ -129,8 +123,7 @@ class DatabaseConfig {
       const options = {
         maxPoolSize: 5,
         serverSelectionTimeoutMS: 5000,
-        socketTimeoutMS: 45000,
-        bufferMaxEntries: 0
+        socketTimeoutMS: 45000
       };
       
       this.connection = await mongoose.connect(uri, options);
