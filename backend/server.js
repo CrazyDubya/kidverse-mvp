@@ -12,6 +12,7 @@ const jwt = require('jsonwebtoken');
 dotenv.config();
 
 const dashboardRoutes = require('./routes/dashboard');
+const authRoutes = require('./routes/auth');
 
 // Initialize Express app
 const app = express();
@@ -303,9 +304,7 @@ app.get('/api', (req, res) => {
 // app.use('/api/parents', authenticateToken, parentRoutes);
 
 // Placeholder routes (remove when actual routes are implemented)
-app.use('/api/auth', (req, res) => {
-  res.status(200).json({ message: 'Auth routes - to be implemented' });
-});
+app.use('/api/auth', authRoutes);
 
 app.use('/api/users', authenticateToken, (req, res) => {
   // SECURITY FIX: Don't expose full user object, only safe fields
@@ -440,8 +439,10 @@ process.on('SIGINT', () => {
   });
 });
 
-// Start the server
-startServer();
+// Start the server (not when imported by tests)
+if (require.main === module) {
+  startServer();
+}
 
 // Export for testing
 module.exports = { app, server, io };

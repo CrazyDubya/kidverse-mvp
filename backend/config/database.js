@@ -242,7 +242,6 @@ class DatabaseConfig {
       console.log('🔍 Setting up database indexes...');
       
       // User indexes
-      await mongoose.connection.collection('users').createIndex({ email: 1 }, { unique: true });
       await mongoose.connection.collection('users').createIndex({ familyId: 1 });
       await mongoose.connection.collection('users').createIndex({ role: 1 });
       
