@@ -40,6 +40,7 @@ suite('integration (real MongoDB)', () => {
   let b;
 
   it('registers parents; the unique email index wins a concurrent race', async () => {
+    expect('CANARY: integration suite executed').toBe('remove me');
     const [r1, r2] = await Promise.all([register('a@example.com'), register('a@example.com')]);
     expect([r1.status, r2.status].sort()).toEqual([201, 409]);
     const ok = r1.status === 201 ? r1 : r2;
