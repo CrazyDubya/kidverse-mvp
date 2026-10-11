@@ -1,650 +1,436 @@
 const express = require('express');
-const router = express.Router();
-const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const mongoose = require('mongoose');
 
-// Rate limiter for dashboard API endpoints
-const dashboardRateLimit = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: {
-    error: 'Too many requests',
-    message: 'Please try again later'
-  },
-  standardHeaders: true,
-  legacyHeaders: false
-});
+const { authenticate, authorize } = require('../middleware/auth');
+const User = require('../models/User');
+const Interaction = require('../models/Interaction');
+const Alert = require('../models/Alert');
+const Config = require('../models/Config');
+const { recordInteraction } = require('../services/interactionService');
 
-// Apply rate limiting to all dashboard routes
-router.use(dashboardRateLimit);
+const router = express.Router();
 
-// Middleware for input validation
-const validatePagination = (req, res, next) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
+const requireGuardian = authorize(['parent', 'admin']);
 
-  if (page < 1) {
-    return res.status(400).json({
-      error: 'Invalid pagination',
-      message: 'Page number must be greater than 0'
-    });
+// Mongoose's ObjectId.isValid() also accepts any 12-character string, so be strict
+const OBJECT_ID = /^[a-fA-F0-9]{24}$/;
+const isObjectId = (v) => typeof v === 'string' && OBJECT_ID.test(v);
+
+const fail = (res, status, error, message) => res.status(status).json({ error, message });
+
+// ---------- shared middleware ----------
+
+router.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests', message: 'Please try again later' }
+  })
+);
+
+// Every dashboard query is scoped to the caller's family; there is no cross-family access.
+const requireFamily = (req, res, next) => {
+  if (!req.user.familyId) {
+    return fail(res, 403, 'Access denied', 'Your account is not part of a family');
   }
+  req.familyId = req.user.familyId;
+  next();
+};
 
-  if (limit < 1 || limit > 100) {
-    return res.status(400).json({
-      error: 'Invalid pagination',
-      message: 'Limit must be between 1 and 100'
-    });
+const validatePagination = (req, res, next) => {
+  const { page: rawPage, limit: rawLimit } = req.query;
+  if ([rawPage, rawLimit].some((v) => v !== undefined && typeof v !== 'string')) {
+    return fail(res, 400, 'Invalid pagination', 'page and limit must be numbers');
+  }
+  const page = rawPage === undefined ? 1 : parseInt(rawPage, 10);
+  const limit = rawLimit === undefined ? 20 : parseInt(rawLimit, 10);
+
+  if (!Number.isInteger(page) || page < 1) {
+    return fail(res, 400, 'Invalid pagination', 'Page number must be greater than 0');
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return fail(res, 400, 'Invalid pagination', 'Limit must be between 1 and 100');
   }
 
   req.pagination = { page, limit, skip: (page - 1) * limit };
   next();
 };
 
-// SECURITY FIX: Proper JWT authentication middleware
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({
-      error: 'Authentication required',
-      message: 'Please provide a valid authentication token'
-    });
-  }
-
-  const token = authHeader.substring(7);
-
-  // SECURITY: Require JWT_SECRET to be configured
-  if (!process.env.JWT_SECRET) {
-    console.error('CRITICAL: JWT_SECRET not configured');
-    return res.status(500).json({
-      error: 'Server configuration error',
-      message: 'Authentication service unavailable'
-    });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    req.user = decoded;
-    next();
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        error: 'Token expired',
-        message: 'Please log in again'
-      });
+const requireStringQuery = (...names) => (req, res, next) => {
+  for (const name of names) {
+    if (req.query[name] !== undefined && typeof req.query[name] !== 'string') {
+      return fail(res, 400, 'Invalid query', `${name} must be a single value`);
     }
-    return res.status(401).json({
-      error: 'Invalid token',
-      message: 'Authentication failed'
-    });
-  }
-};
-
-// Validate MongoDB ObjectId
-const validateObjectId = (paramName) => (req, res, next) => {
-  const id = req.params[paramName];
-  if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      error: 'Invalid ID',
-      message: `${paramName} must be a valid identifier`
-    });
   }
   next();
 };
 
+// Resolve a child id to a member of the caller's family, or null. Used for every userId filter.
+const findFamilyMember = (familyId, userId) =>
+  isObjectId(userId) ? User.findOne({ _id: userId, familyId }).select('_id role').lean() : null;
+
+// ---------- status ----------
+
 /**
  * GET /api/status
- * Get overall safety status and summary statistics
  */
-router.get('/status', authenticate, async (req, res) => {
+router.get('/status', authenticate, requireGuardian, requireFamily, async (req, res, next) => {
   try {
-    // TODO: Replace with actual database queries
-    // This is a placeholder structure for MVP
-    const status = {
-      overallStatus: 'safe', // 'safe', 'warning', 'critical'
+    const familyId = req.familyId;
+    const now = Date.now();
+    const since24h = new Date(now - 24 * 60 * 60 * 1000);
+    const since7d = new Date(now - 7 * 24 * 60 * 60 * 1000);
+    const open = { $in: ['pending', 'escalated'] };
+
+    const [
+      totalInteractions,
+      flaggedInteractions,
+      activeAlerts,
+      resolvedAlerts,
+      interactions24h,
+      interactions7d,
+      alerts24h,
+      alerts7d,
+      urgentOpen,
+      anyOpen,
+      config
+    ] = await Promise.all([
+      Interaction.countDocuments({ familyId }),
+      Interaction.countDocuments({ familyId, flagged: true }),
+      Alert.countDocuments({ familyId, status: open }),
+      Alert.countDocuments({ familyId, status: { $in: ['resolved', 'dismissed'] } }),
+      Interaction.countDocuments({ familyId, timestamp: { $gte: since24h } }),
+      Interaction.countDocuments({ familyId, timestamp: { $gte: since7d } }),
+      Alert.countDocuments({ familyId, createdAt: { $gte: since24h } }),
+      Alert.countDocuments({ familyId, createdAt: { $gte: since7d } }),
+      Alert.countDocuments({ familyId, status: open, severity: { $in: ['high', 'critical'] } }),
+      Alert.countDocuments({ familyId, status: open }),
+      Config.findOne({ familyId }).lean()
+    ]);
+
+    res.json({
+      overallStatus: urgentOpen > 0 ? 'critical' : anyOpen > 0 ? 'warning' : 'safe',
       lastUpdated: new Date().toISOString(),
       statistics: {
-        totalInteractions: 0,
-        flaggedInteractions: 0,
-        activeAlerts: 0,
-        resolvedAlerts: 0,
-        monitoringEnabled: true
+        totalInteractions,
+        flaggedInteractions,
+        activeAlerts,
+        resolvedAlerts,
+        monitoringEnabled: config && config.monitoringEnabled === false ? false : true
       },
       recentActivity: {
-        last24Hours: {
-          interactions: 0,
-          alerts: 0
-        },
-        last7Days: {
-          interactions: 0,
-          alerts: 0
-        }
+        last24Hours: { interactions: interactions24h, alerts: alerts24h },
+        last7Days: { interactions: interactions7d, alerts: alerts7d }
       },
-      systemHealth: {
-        apiStatus: 'operational',
-        lastCheckIn: new Date().toISOString()
-      }
-    };
-
-    res.json(status);
-  } catch (error) {
-    console.error('Error fetching safety status:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to retrieve safety status' 
+      systemHealth: { apiStatus: 'operational', lastCheckIn: new Date().toISOString() }
     });
+  } catch (err) {
+    next(err);
   }
 });
+
+// ---------- interactions ----------
 
 /**
  * GET /api/interactions
- * Get interaction history with pagination and optional filters
  */
-router.get('/interactions', authenticate, validatePagination, async (req, res) => {
+router.get(
+  '/interactions',
+  authenticate,
+  requireGuardian,
+  requireFamily,
+  validatePagination,
+  requireStringQuery('startDate', 'endDate', 'flagged', 'userId'),
+  async (req, res, next) => {
+    try {
+      const { page, limit, skip } = req.pagination;
+      const { startDate, endDate, flagged, userId } = req.query;
+      const filter = { familyId: req.familyId };
+
+      if (startDate || endDate) {
+        filter.timestamp = {};
+        for (const [name, value, op] of [['startDate', startDate, '$gte'], ['endDate', endDate, '$lte']]) {
+          if (!value) continue;
+          const date = new Date(value);
+          if (isNaN(date.getTime())) {
+            return fail(res, 400, 'Invalid date format', `${name} must be a valid ISO 8601 date`);
+          }
+          filter.timestamp[op] = date;
+        }
+      }
+
+      if (flagged !== undefined) filter.flagged = flagged === 'true';
+
+      if (userId !== undefined) {
+        const member = await findFamilyMember(req.familyId, userId);
+        if (!member) return fail(res, 404, 'Not found', 'User not found');
+        filter.userId = member._id;
+      }
+
+      const [interactions, total] = await Promise.all([
+        Interaction.find(filter).sort({ timestamp: -1 }).skip(skip).limit(limit).lean(),
+        Interaction.countDocuments(filter)
+      ]);
+
+      res.json({
+        interactions,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+          hasNext: page * limit < total,
+          hasPrev: page > 1
+        }
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/interactions
+ * Ingestion path for observed messages. A child may report only for themself; a guardian
+ * may report for any child in their family. Runs threat detection and raises alerts.
+ */
+router.post('/interactions', authenticate, requireFamily, async (req, res, next) => {
   try {
-    const { page, limit, skip } = req.pagination;
-    const { startDate, endDate, flagged, userId } = req.query;
-    if ([startDate, endDate, flagged, userId].some(v => v !== undefined && typeof v !== 'string')) {
-      return res.status(400).json({ error: 'Invalid query', message: 'Query parameters must be strings' });
-    }
+    const { message, contact, direction, timestamp } = req.body || {};
+    let { userId } = req.body || {};
 
-    // Build filter object
-    const filters = {};
-    
-    if (startDate || endDate) {
-      filters.timestamp = {};
-      if (startDate) {
-        const start = new Date(startDate);
-        if (isNaN(start.getTime())) {
-          return res.status(400).json({ 
-            error: 'Invalid date format', 
-            message: 'startDate must be a valid ISO 8601 date' 
-          });
-        }
-        filters.timestamp.$gte = start;
-      }
-      if (endDate) {
-        const end = new Date(endDate);
-        if (isNaN(end.getTime())) {
-          return res.status(400).json({ 
-            error: 'Invalid date format', 
-            message: 'endDate must be a valid ISO 8601 date' 
-          });
-        }
-        filters.timestamp.$lte = end;
+    if (typeof message !== 'string' || !message.trim() || message.length > 2000) {
+      return fail(res, 400, 'Invalid message', 'message must be a string of 1-2000 characters');
+    }
+    if (contact !== undefined && (typeof contact !== 'string' || contact.length > 100)) {
+      return fail(res, 400, 'Invalid contact', 'contact must be a string of at most 100 characters');
+    }
+    if (direction !== undefined && !['incoming', 'outgoing'].includes(direction)) {
+      return fail(res, 400, 'Invalid direction', 'direction must be incoming or outgoing');
+    }
+    let when;
+    if (timestamp !== undefined) {
+      when = typeof timestamp === 'string' ? new Date(timestamp) : null;
+      if (!when || isNaN(when.getTime()) || when.getTime() > Date.now() + 5 * 60 * 1000) {
+        return fail(res, 400, 'Invalid timestamp', 'timestamp must be a valid ISO 8601 date that is not in the future');
       }
     }
-    
-    if (flagged !== undefined) {
-      filters.flagged = flagged === 'true';
+
+    const isChild = req.user.role === 'child';
+    if (isChild) {
+      if (userId !== undefined && String(userId) !== String(req.user._id)) {
+        return fail(res, 403, 'Access denied', 'Children can only report their own interactions');
+      }
+      userId = String(req.user._id);
+    } else if (userId === undefined) {
+      return fail(res, 400, 'Invalid userId', 'userId is required');
     }
 
-    // SECURITY FIX: Prevent IDOR - users can only access their own data
-    // or their children's data if they are a parent
-    if (userId) {
-      // Validate userId is a valid ObjectId
-      if (!mongoose.Types.ObjectId.isValid(userId)) {
-        return res.status(400).json({
-          error: 'Invalid user ID',
-          message: 'userId must be a valid identifier'
-        });
-      }
+    const member = await findFamilyMember(req.familyId, userId);
+    if (!member || member.role !== 'child') return fail(res, 404, 'Not found', 'Child not found');
 
-      // Authorization: own data, or admin. Parent access to a child's data requires
-      // verifying family membership against the User model, which does not exist yet,
-      // so it is denied (fail closed) until that lookup is implemented.
-      const isOwnData = req.user.userId === userId;
-      const isAdmin = req.user.role === 'admin';
-      if (!isOwnData && !isAdmin) {
-        return res.status(403).json({
-          error: 'Access denied',
-          message: 'You can only access your own data'
-        });
-      }
-      filters.userId = userId;
-    } else {
-      // Default to showing only the authenticated user's data
-      filters.userId = req.user.userId;
-    }
-
-    // TODO: Replace with actual database queries
-    // Example with MongoDB:
-    // const interactions = await Interaction.find(filters)
-    //   .sort({ timestamp: -1 })
-    //   .skip(skip)
-    //   .limit(limit);
-    // const total = await Interaction.countDocuments(filters);
-
-    const interactions = [];
-    const total = 0;
-
-    res.json({
-      interactions,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasNext: page * limit < total,
-        hasPrev: page > 1
-      },
+    const result = await recordInteraction({
+      familyId: req.familyId,
+      userId: member._id,
+      message: message.trim(),
+      contact,
+      direction,
+      timestamp: when,
+      io: req.app.get('io')
     });
-  } catch (error) {
-    console.error('Error fetching interactions:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to retrieve interaction history' 
+
+    if (result.skipped) return res.status(202).json({ success: true, skipped: true });
+
+    // Children don't get to see whether they triggered an alert
+    res.status(201).json({
+      success: true,
+      flagged: isChild ? undefined : result.interaction.flagged,
+      interactionId: isChild ? undefined : result.interaction._id,
+      alertId: isChild || !result.alert ? undefined : result.alert._id
     });
+  } catch (err) {
+    next(err);
   }
 });
+
+// ---------- alerts ----------
 
 /**
  * GET /api/alerts
- * Get safety alerts with optional filtering
  */
-router.get('/alerts', authenticate, async (req, res) => {
-  try {
-    const { status, severity, limit } = req.query;
-    if ([status, severity, limit].some(v => v !== undefined && typeof v !== 'string')) {
-      return res.status(400).json({ error: 'Invalid query', message: 'Query parameters must be strings' });
-    }
+router.get(
+  '/alerts',
+  authenticate,
+  requireGuardian,
+  requireFamily,
+  requireStringQuery('status', 'severity', 'limit', 'userId'),
+  async (req, res, next) => {
+    try {
+      const { status, severity, limit, userId } = req.query;
+      const filter = { familyId: req.familyId };
 
-    // Build filter object
-    const filters = {};
-
-    // SECURITY FIX: Add ownership filter - users can only see alerts for their family
-    if (req.user.role === 'admin') {
-      // Admins can see all alerts (no filter)
-    } else if (req.user.role === 'parent' && req.user.familyId) {
-      // Parents see alerts for their family
-      filters.familyId = req.user.familyId;
-    } else {
-      // Children and others only see their own alerts
-      filters.userId = req.user.userId;
-    }
-    
-    if (status) {
-      const validStatuses = ['pending', 'reviewed', 'resolved', 'dismissed'];
-      if (!validStatuses.includes(status)) {
-        return res.status(400).json({ 
-          error: 'Invalid status', 
-          message: `Status must be one of: ${validStatuses.join(', ')}` 
-        });
+      if (status !== undefined) {
+        if (!Alert.STATUSES.includes(status)) {
+          return fail(res, 400, 'Invalid status', `Status must be one of: ${Alert.STATUSES.join(', ')}`);
+        }
+        filter.status = status;
       }
-      filters.status = status;
-    }
-    
-    if (severity) {
-      const validSeverities = ['low', 'medium', 'high', 'critical'];
-      if (!validSeverities.includes(severity)) {
-        return res.status(400).json({ 
-          error: 'Invalid severity', 
-          message: `Severity must be one of: ${validSeverities.join(', ')}` 
-        });
+      if (severity !== undefined) {
+        if (!Alert.SEVERITIES.includes(severity)) {
+          return fail(res, 400, 'Invalid severity', `Severity must be one of: ${Alert.SEVERITIES.join(', ')}`);
+        }
+        filter.severity = severity;
       }
-      filters.severity = severity;
+      if (userId !== undefined) {
+        const member = await findFamilyMember(req.familyId, userId);
+        if (!member) return fail(res, 404, 'Not found', 'User not found');
+        filter.userId = member._id;
+      }
+
+      const parsed = parseInt(limit, 10);
+      const queryLimit = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 100) : 50;
+
+      const alerts = await Alert.find(filter).sort({ createdAt: -1 }).limit(queryLimit).lean();
+      res.json({ alerts, count: alerts.length });
+    } catch (err) {
+      next(err);
     }
-
-    const parsedLimit = parseInt(limit, 10);
-    const queryLimit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 50;
-
-    // TODO: Replace with actual database queries
-    // Example:
-    // const alerts = await Alert.find(filters)
-    //   .sort({ createdAt: -1, severity: -1 })
-    //   .limit(queryLimit);
-
-    const alerts = [];
-
-    res.json({
-      alerts,
-      count: alerts.length,
-      filters: filters
-    });
-  } catch (error) {
-    console.error('Error fetching alerts:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to retrieve alerts' 
-    });
   }
-});
+);
 
 /**
  * POST /api/alerts/:id/review
- * Mark an alert as reviewed with optional notes
  */
-router.post('/alerts/:id/review', authenticate, validateObjectId('id'), async (req, res) => {
+router.post('/alerts/:id/review', authenticate, requireGuardian, requireFamily, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { action, notes } = req.body;  // SECURITY: Removed reviewedBy from user input
+    const { action, notes } = req.body || {};
 
-    // SECURITY: reviewedBy should always be the authenticated user, not user input
-    const reviewedBy = req.user.userId;
+    if (!isObjectId(id)) return fail(res, 400, 'Invalid ID', 'id must be a valid identifier');
 
-    // Validate action
-    const validActions = ['resolved', 'dismissed', 'escalated', 'pending'];
-    if (!action || !validActions.includes(action)) {
-      return res.status(400).json({ 
-        error: 'Invalid action', 
-        message: `Action must be one of: ${validActions.join(', ')}` 
-      });
+    const validActions = ['reviewed', 'resolved', 'dismissed', 'escalated', 'pending'];
+    if (typeof action !== 'string' || !validActions.includes(action)) {
+      return fail(res, 400, 'Invalid action', `Action must be one of: ${validActions.join(', ')}`);
+    }
+    if (notes !== undefined && (typeof notes !== 'string' || notes.length > 1000)) {
+      return fail(res, 400, 'Invalid notes', 'Notes must be a string of at most 1000 characters');
     }
 
-    // Validate notes (optional but should be string if provided)
-    if (notes !== undefined && typeof notes !== 'string') {
-      return res.status(400).json({ 
-        error: 'Invalid notes', 
-        message: 'Notes must be a string' 
-      });
-    }
+    // Matching on familyId means another family's alert is indistinguishable from a missing one
+    const alert = await Alert.findOneAndUpdate(
+      { _id: id, familyId: req.familyId },
+      { $set: { status: action, reviewedBy: req.user._id, reviewedAt: new Date(), reviewNotes: notes || null } },
+      { new: true }
+    ).lean();
 
-    if (typeof notes === 'string' && notes.length > 1000) {
-      return res.status(400).json({ error: 'Invalid notes', message: 'Notes must be 1000 characters or fewer' });
-    }
+    if (!alert) return fail(res, 404, 'Not found', 'Alert not found');
 
-    // TODO: Replace with actual database update
-    // Example:
-    // const alert = await Alert.findById(id);
-    // if (!alert) {
-    //   return res.status(404).json({ 
-    //     error: 'Not found', 
-    //     message: 'Alert not found' 
-    //   });
-    // }
-    // 
-    // alert.status = action;
-    // alert.reviewedAt = new Date();
-    // alert.reviewedBy = reviewedBy || req.user.id;
-    // alert.reviewNotes = notes;
-    // await alert.save();
-
-    // Placeholder response - SECURITY: reviewedBy is always from authenticated user
-    const updatedAlert = {
-      id,
-      status: action,
-      reviewedAt: new Date().toISOString(),
-      reviewedBy: reviewedBy,  // Always from req.user.userId
-      reviewNotes: notes || null
-    };
-
-    res.json({
-      success: true,
-      message: `Alert ${action} successfully`,
-      alert: updatedAlert
-    });
-  } catch (error) {
-    console.error('Error reviewing alert:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to review alert' 
-    });
+    res.json({ success: true, message: `Alert ${action} successfully`, alert });
+  } catch (err) {
+    next(err);
   }
 });
 
+// ---------- config ----------
+
+const isBool = (v) => typeof v === 'boolean';
+const isSeverity = (v) => Alert.SEVERITIES.includes(v);
+const intBetween = (min, max) => (v) => Number.isInteger(v) && v >= min && v <= max;
+
+// Every settable leaf path and how to validate it. Anything not listed is rejected.
+const CONFIG_SPEC = {
+  monitoringEnabled: isBool,
+  'alertThresholds.inappropriate.enabled': isBool,
+  'alertThresholds.inappropriate.severity': isSeverity,
+  'alertThresholds.suspicious.enabled': isBool,
+  'alertThresholds.suspicious.severity': isSeverity,
+  'alertThresholds.excessive.enabled': isBool,
+  'alertThresholds.excessive.severity': isSeverity,
+  'alertThresholds.excessive.threshold': intBetween(1, 10000),
+  'notifications.email.enabled': isBool,
+  'notifications.email.address': (v) => v === '' || (typeof v === 'string' && v.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)),
+  'notifications.sms.enabled': isBool,
+  'notifications.sms.phone': (v) => v === '' || (typeof v === 'string' && /^\+?[1-9]\d{1,14}$/.test(v)),
+  'notifications.push.enabled': isBool,
+  'contentFilters.profanity': isBool,
+  'contentFilters.violence': isBool,
+  'contentFilters.adult': isBool,
+  'contentFilters.personalInfo': isBool,
+  'dataRetention.interactions': intBetween(1, 365),
+  'dataRetention.alerts': intBetween(1, 365)
+};
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Flatten nested updates to dotted leaf paths; returns null on anything that isn't a plain object tree
+const flatten = (obj, prefix = '', out = {}) => {
+  for (const key of Object.keys(obj)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (Object.prototype.hasOwnProperty.call(CONFIG_SPEC, path)) {
+      out[path] = obj[key];
+    } else if (isPlainObject(obj[key]) && Object.keys(CONFIG_SPEC).some((p) => p.startsWith(`${path}.`))) {
+      flatten(obj[key], path, out);
+    } else {
+      out[path] = obj[key]; // unknown path: caught by the spec check
+    }
+  }
+  return out;
+};
+
+const deepMerge = (base, override) => {
+  const out = Array.isArray(base) ? [...base] : { ...base };
+  for (const [k, v] of Object.entries(override || {})) {
+    out[k] = isPlainObject(v) && isPlainObject(base[k]) ? deepMerge(base[k], v) : v;
+  }
+  return out;
+};
+
+const presentConfig = (stored) => {
+  const { _id, familyId, __v, createdAt, ...rest } = stored || {};
+  return { ...deepMerge(Config.DEFAULTS, rest), lastUpdated: (stored && stored.updatedAt) || null };
+};
+
 /**
  * GET /api/config
- * Get current monitoring configuration settings
  */
-router.get('/config', authenticate, async (req, res) => {
+router.get('/config', authenticate, requireGuardian, requireFamily, async (req, res, next) => {
   try {
-    // SECURITY: Config is scoped to user/family
-    // TODO: Replace with actual database query or config file
-    // Example:
-    // const config = await Config.findOne({
-    //   $or: [
-    //     { userId: req.user.userId },
-    //     { familyId: req.user.familyId }
-    //   ]
-    // });
-
-    const config = {
-      monitoringEnabled: true,
-      alertThresholds: {
-        inappropriate: {
-          enabled: true,
-          severity: 'high'
-        },
-        suspicious: {
-          enabled: true,
-          severity: 'medium'
-        },
-        excessive: {
-          enabled: true,
-          threshold: 100, // interactions per hour
-          severity: 'low'
-        }
-      },
-      notifications: {
-        email: {
-          enabled: false,
-          address: ''
-        },
-        sms: {
-          enabled: false,
-          phone: ''
-        },
-        push: {
-          enabled: true
-        }
-      },
-      contentFilters: {
-        profanity: true,
-        violence: true,
-        adult: true,
-        personalInfo: true
-      },
-      dataRetention: {
-        interactions: 90, // days
-        alerts: 365 // days
-      },
-      lastUpdated: new Date().toISOString()
-    };
-
-    res.json(config);
-  } catch (error) {
-    console.error('Error fetching config:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to retrieve configuration' 
-    });
+    const stored = await Config.findOne({ familyId: req.familyId }).lean();
+    res.json(presentConfig(stored));
+  } catch (err) {
+    next(err);
   }
 });
 
 /**
  * POST /api/config
- * Update monitoring configuration settings
  */
-router.post('/config', authenticate, async (req, res) => {
+router.post('/config', authenticate, requireGuardian, requireFamily, async (req, res, next) => {
   try {
-    // SECURITY: Only parents and admins can modify config
-    if (req.user.role !== 'parent' && req.user.role !== 'admin') {
-      return res.status(403).json({
-        error: 'Access denied',
-        message: 'Only parents can modify monitoring configuration'
-      });
-    }
-
     const updates = req.body;
-
-    // Validate configuration updates
-    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
-      return res.status(400).json({
-        error: 'Invalid request',
-        message: 'Configuration updates must be provided as an object'
-      });
+    if (!isPlainObject(updates) || Object.keys(updates).length === 0) {
+      return fail(res, 400, 'Invalid request', 'Configuration updates must be provided as a non-empty object');
     }
 
-    // SECURITY: Prevent prototype pollution
-    const dangerousKeys = ['__proto__', 'constructor', 'prototype'];
-    const hasDangerousKey = (obj) => {
-      if (typeof obj !== 'object' || obj === null) return false;
-      for (const key of Object.keys(obj)) {
-        if (dangerousKeys.includes(key)) return true;
-        if (typeof obj[key] === 'object' && hasDangerousKey(obj[key])) return true;
-      }
-      return false;
-    };
-
-    if (hasDangerousKey(updates)) {
-      return res.status(400).json({
-        error: 'Invalid request',
-        message: 'Invalid configuration keys detected'
-      });
+    const flat = flatten(updates);
+    for (const [path, value] of Object.entries(flat)) {
+      const validate = Object.prototype.hasOwnProperty.call(CONFIG_SPEC, path) ? CONFIG_SPEC[path] : null;
+      if (!validate) return fail(res, 400, 'Invalid configuration', `Unknown setting: ${path}`);
+      if (!validate(value)) return fail(res, 400, 'Invalid configuration', `Invalid value for ${path}`);
     }
 
-    // Validate monitoringEnabled if provided
-    if (updates.monitoringEnabled !== undefined && typeof updates.monitoringEnabled !== 'boolean') {
-      return res.status(400).json({ 
-        error: 'Invalid configuration', 
-        message: 'monitoringEnabled must be a boolean' 
-      });
-    }
+    const stored = await Config.findOneAndUpdate(
+      { familyId: req.familyId },
+      { $set: flat },
+      { new: true, upsert: true }
+    ).lean();
 
-    // Validate alertThresholds if provided
-    if (updates.alertThresholds) {
-      if (typeof updates.alertThresholds !== 'object') {
-        return res.status(400).json({ 
-          error: 'Invalid configuration', 
-          message: 'alertThresholds must be an object' 
-        });
-      }
-    }
-
-    // Validate notifications if provided
-    if (updates.notifications) {
-      if (typeof updates.notifications !== 'object') {
-        return res.status(400).json({ 
-          error: 'Invalid configuration', 
-          message: 'notifications must be an object' 
-        });
-      }
-      
-      // Validate email if provided
-      if (updates.notifications.email?.address) {
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(updates.notifications.email.address)) {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: 'Invalid email address format' 
-          });
-        }
-      }
-      
-      // Validate phone if provided
-      if (updates.notifications.sms?.phone) {
-        const phoneRegex = /^\+?[1-9]\d{1,14}$/;
-        if (!phoneRegex.test(updates.notifications.sms.phone)) {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: 'Invalid phone number format (use E.164 format)' 
-          });
-        }
-      }
-    }
-
-    // Validate contentFilters if provided
-    if (updates.contentFilters) {
-      if (typeof updates.contentFilters !== 'object') {
-        return res.status(400).json({ 
-          error: 'Invalid configuration', 
-          message: 'contentFilters must be an object' 
-        });
-      }
-      
-      const validFilters = ['profanity', 'violence', 'adult', 'personalInfo'];
-      for (const [key, value] of Object.entries(updates.contentFilters)) {
-        if (!validFilters.includes(key)) {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: `Invalid content filter: ${key}. Valid filters: ${validFilters.join(', ')}` 
-          });
-        }
-        if (typeof value !== 'boolean') {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: `Content filter ${key} must be a boolean` 
-          });
-        }
-      }
-    }
-
-    // Validate dataRetention if provided
-    if (updates.dataRetention) {
-      if (typeof updates.dataRetention !== 'object') {
-        return res.status(400).json({ 
-          error: 'Invalid configuration', 
-          message: 'dataRetention must be an object' 
-        });
-      }
-      
-      if (updates.dataRetention.interactions !== undefined) {
-        const interactions = parseInt(updates.dataRetention.interactions);
-        if (isNaN(interactions) || interactions < 1 || interactions > 365) {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: 'interactions retention must be between 1 and 365 days' 
-          });
-        }
-      }
-      
-      if (updates.dataRetention.alerts !== undefined) {
-        const alerts = parseInt(updates.dataRetention.alerts);
-        if (isNaN(alerts) || alerts < 1 || alerts > 365) {
-          return res.status(400).json({ 
-            error: 'Invalid configuration', 
-            message: 'alerts retention must be between 1 and 365 days' 
-          });
-        }
-      }
-    }
-
-    // TODO: Replace with actual database update
-    // Example:
-    // const config = await Config.findOneAndUpdate(
-    //   { userId: req.user.id },
-    //   { 
-    //     ...updates,
-    //     lastUpdated: new Date()
-    //   },
-    //   { new: true, upsert: true }
-    // );
-
-    // Whitelist known top-level keys; ignore anything else the client sent
-    const allowedKeys = ['monitoringEnabled', 'alertThresholds', 'notifications', 'contentFilters', 'dataRetention'];
-    const sanitizedUpdates = {};
-    for (const key of allowedKeys) {
-      if (updates[key] !== undefined) sanitizedUpdates[key] = updates[key];
-    }
-
-    const updatedConfig = {
-      ...sanitizedUpdates,
-      lastUpdated: new Date().toISOString()
-    };
-
-    res.json({
-      success: true,
-      message: 'Configuration updated successfully',
-      config: updatedConfig
-    });
-  } catch (error) {
-    console.error('Error updating config:', error);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: 'Failed to update configuration' 
-    });
+    res.json({ success: true, message: 'Configuration updated successfully', config: presentConfig(stored) });
+  } catch (err) {
+    next(err);
   }
-});
-
-// Error handling middleware for this router
-router.use((err, req, res, next) => {
-  console.error('Dashboard route error:', err);
-  res.status(err.status || 500).json({
-    error: 'Internal server error',
-    message: 'An error occurred processing your request'
-  });
 });
 
 module.exports = router;
