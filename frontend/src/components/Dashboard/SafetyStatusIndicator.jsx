@@ -1,4 +1,3 @@
-import React from 'react';
 
 const SafetyStatusIndicator = ({ status, lastUpdate }) => {
   const getStatusConfig = () => {

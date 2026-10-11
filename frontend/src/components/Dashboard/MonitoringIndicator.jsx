@@ -1,4 +1,3 @@
-import React from 'react';
 
 const MonitoringIndicator = ({ isActive, monitoredPlatforms, lastSync }) => {
   return (
@@ -54,7 +53,7 @@ const MonitoringIndicator = ({ isActive, monitoredPlatforms, lastSync }) => {
       {/* Transparency Notice */}
       <div className="mt-3 pt-3 border-t border-gray-100">
         <p className="text-xs text-gray-500 italic">
-          🔒 All monitoring is transparent and privacy-focused. Data is processed locally and only safety alerts are stored.
+          🔒 Monitoring is transparent. Messages are analyzed for safety and stored so your family can review them; only your family can see them.
         </p>
       </div>
     </div>
