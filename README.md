@@ -46,7 +46,7 @@ kidverse-mvp/
 
 #### Prerequisites
 
-- Node.js (v18 or higher)
+- Node.js (v20.19.5 or higher)
 - npm or yarn
 - MongoDB (local or Atlas)
 
