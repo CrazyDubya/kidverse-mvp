@@ -1,7 +1,6 @@
-import React from 'react';
 
 const FilteringOptions = ({ filters, onFilterChange }) => {
-  const platforms = ['All', 'Roblox', 'Minecraft', 'Discord'];
+  const platforms = ['All', 'Roblox'];
   const timeRanges = [
     { value: '24h', label: 'Last 24 Hours' },
     { value: '7d', label: 'Last 7 Days' },

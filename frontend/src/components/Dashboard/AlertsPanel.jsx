@@ -1,6 +1,5 @@
-import React from 'react';
 
-const AlertsPanel = ({ alerts }) => {
+const AlertsPanel = ({ alerts, onReview }) => {
   const getCategoryIcon = (category) => {
     switch (category) {
       case 'inappropriate_content':
@@ -48,7 +47,7 @@ const AlertsPanel = ({ alerts }) => {
         <div className="text-center py-8">
           <div className="text-4xl mb-2">✅</div>
           <p className="text-gray-600">No active alerts</p>
-          <p className="text-sm text-gray-500">Your child's activity looks safe</p>
+          <p className="text-sm text-gray-500">Your child&apos;s activity looks safe</p>
         </div>
       ) : (
         <div className="space-y-3">
@@ -72,6 +71,22 @@ const AlertsPanel = ({ alerts }) => {
                     <span>Platform: {alert.platform}</span>
                     <span>Severity: {alert.severity}</span>
                   </div>
+                  {onReview && (
+                    <div className="flex space-x-2 mt-3">
+                      <button
+                        onClick={() => onReview(alert.id, 'resolved')}
+                        className="rounded bg-green-100 px-3 py-1 text-xs font-medium text-green-800 hover:bg-green-200"
+                      >
+                        Resolve
+                      </button>
+                      <button
+                        onClick={() => onReview(alert.id, 'dismissed')}
+                        className="rounded bg-gray-100 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-200"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

@@ -1,157 +1,98 @@
-import React, { useState, useEffect } from 'react';
+import { useState } from 'react';
 import SafetyStatusIndicator from './SafetyStatusIndicator';
 import InteractionsList from './InteractionsList';
 import AlertsPanel from './AlertsPanel';
 import FilteringOptions from './FilteringOptions';
 import MonitoringIndicator from './MonitoringIndicator';
-import { sampleData } from './sampleData';
+import { useDashboardData } from '../../hooks/useDashboardData';
+import { useAuth } from '../../store/auth';
+
+const GuardianOnly = ({ onLogout }) => (
+  <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
+    <div className="bg-white p-8 rounded-lg shadow-sm border border-gray-200 max-w-md text-center">
+      <h1 className="text-xl font-semibold text-gray-800 mb-2">This dashboard is for parents and guardians</h1>
+      <p className="text-gray-600 mb-4">Ask your parent or guardian to sign in to see safety information.</p>
+      <button onClick={onLogout} className="text-sm text-blue-700 underline">Sign out</button>
+    </div>
+  </div>
+);
 
 const Dashboard = () => {
-  const [filters, setFilters] = useState({
-    platform: 'all',
-    timeRange: '24h',
-    threatLevel: 'all'
-  });
-  
-  const [filteredData, setFilteredData] = useState(sampleData);
-  const [overallStatus, setOverallStatus] = useState('safe');
+  const user = useAuth((s) => s.user);
+  const logout = useAuth((s) => s.logout);
 
-  // Filter data based on current filters
-  useEffect(() => {
-    let filtered = { ...sampleData };
-    
-    // Filter interactions
-    filtered.interactions = sampleData.interactions.filter(interaction => {
-      const platformMatch = filters.platform === 'all' || 
-        interaction.platform.toLowerCase() === filters.platform;
-      const threatMatch = filters.threatLevel === 'all' || 
-        interaction.threatLevel === filters.threatLevel;
-      
-      // Time range filtering
-      const now = new Date();
-      const interactionTime = new Date(interaction.timestamp);
-      const timeDiff = now - interactionTime;
-      
-      let timeMatch = true;
-      switch (filters.timeRange) {
-        case '24h':
-          timeMatch = timeDiff <= 24 * 60 * 60 * 1000;
-          break;
-        case '7d':
-          timeMatch = timeDiff <= 7 * 24 * 60 * 60 * 1000;
-          break;
-        case '30d':
-          timeMatch = timeDiff <= 30 * 24 * 60 * 60 * 1000;
-          break;
-      }
-      
-      return platformMatch && threatMatch && timeMatch;
-    });
-    
-    // Filter alerts
-    filtered.alerts = sampleData.alerts.filter(alert => {
-      const platformMatch = filters.platform === 'all' || 
-        alert.platform.toLowerCase() === filters.platform;
-      
-      const now = new Date();
-      const alertTime = new Date(alert.timestamp);
-      const timeDiff = now - alertTime;
-      
-      let timeMatch = true;
-      switch (filters.timeRange) {
-        case '24h':
-          timeMatch = timeDiff <= 24 * 60 * 60 * 1000;
-          break;
-        case '7d':
-          timeMatch = timeDiff <= 7 * 24 * 60 * 60 * 1000;
-          break;
-        case '30d':
-          timeMatch = timeDiff <= 30 * 24 * 60 * 60 * 1000;
-          break;
-      }
-      
-      return platformMatch && timeMatch;
-    });
-    
-    setFilteredData(filtered);
-    
-    // Update overall status based on filtered alerts
-    const highAlerts = filtered.alerts.filter(alert => alert.severity === 'high');
-    const mediumAlerts = filtered.alerts.filter(alert => alert.severity === 'medium');
-    
-    if (highAlerts.length > 0) {
-      setOverallStatus('danger');
-    } else if (mediumAlerts.length > 0) {
-      setOverallStatus('warning');
-    } else {
-      setOverallStatus('safe');
+  const [filters, setFilters] = useState({ platform: 'all', timeRange: '24h', threatLevel: 'all' });
+  const isGuardian = user && (user.role === 'parent' || user.role === 'admin');
+  const data = useDashboardData(filters, Boolean(isGuardian));
+
+  if (!isGuardian) return <GuardianOnly onLogout={logout} />;
+
+  const platforms = [
+    {
+      name: 'Roblox',
+      connected: data.monitoringEnabled,
+      lastActivity: data.latestActivity
     }
-  }, [filters]);
-
-  const handleFilterChange = (newFilters) => {
-    setFilters(newFilters);
-  };
+  ];
 
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">
-            KidVerse Safety Dashboard
-          </h1>
-          <p className="text-gray-600">
-            Monitor your child's online gaming activity and safety
-          </p>
+        <div className="mb-8 flex items-start justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900 mb-2">KidVerse Safety Dashboard</h1>
+            <p className="text-gray-600">Monitor your child&apos;s online gaming activity and safety</p>
+          </div>
+          <div className="text-right text-sm text-gray-600">
+            <p>{user.firstName}</p>
+            <button onClick={logout} className="text-blue-700 underline">Sign out</button>
+          </div>
         </div>
-        
-        {/* Top Row - Status and Monitoring */}
+
+        {data.error && (
+          <div role="alert" className="mb-6 flex items-center justify-between rounded-lg border border-red-200 bg-red-50 p-4 text-red-800">
+            <span>{data.error}</span>
+            <button onClick={data.refresh} className="ml-4 rounded bg-red-100 px-3 py-1 text-sm font-medium hover:bg-red-200">
+              Retry
+            </button>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
           <div className="lg:col-span-2">
-            <SafetyStatusIndicator 
-              status={overallStatus}
-              lastUpdate={new Date().toISOString()}
-            />
+            <SafetyStatusIndicator status={data.overallStatus} lastUpdate={data.lastUpdated || new Date().toISOString()} />
           </div>
           <div>
-            <MonitoringIndicator 
-              isActive={sampleData.monitoring.isActive}
-              monitoredPlatforms={sampleData.monitoring.platforms}
-              lastSync={sampleData.monitoring.lastSync}
+            <MonitoringIndicator
+              isActive={data.monitoringEnabled}
+              monitoredPlatforms={platforms}
+              lastSync={data.lastUpdated || new Date().toISOString()}
             />
           </div>
         </div>
-        
-        {/* Filtering Options */}
+
         <div className="mb-6">
-          <FilteringOptions 
-            filters={filters}
-            onFilterChange={handleFilterChange}
-          />
+          <FilteringOptions filters={filters} onFilterChange={setFilters} />
         </div>
-        
-        {/* Main Content Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left Column */}
-          <div className="space-y-6">
-            <AlertsPanel alerts={filteredData.alerts} />
+
+        {data.loading ? (
+          <p className="text-center text-gray-500" role="status">Loading…</p>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="space-y-6">
+              <AlertsPanel alerts={data.alerts} onReview={data.review} />
+            </div>
+            <div className="space-y-6">
+              <InteractionsList interactions={data.interactions.slice(0, 5)} />
+            </div>
           </div>
-          
-          {/* Right Column */}
-          <div className="space-y-6">
-            <InteractionsList interactions={filteredData.interactions.slice(0, 5)} />
-          </div>
-        </div>
-        
-        {/* Footer */}
-        <div className="mt-8 pt-6 border-t border-gray-200">
-          <div className="text-center text-sm text-gray-500">
-            <p>KidVerse Safety Dashboard • Protecting your child's digital experience</p>
-            <p className="mt-1">
-              Last updated: {new Date().toLocaleString()} • 
-              Showing {filteredData.interactions.length} interactions, {filteredData.alerts.length} alerts
-            </p>
-          </div>
+        )}
+
+        <div className="mt-8 pt-6 border-t border-gray-200 text-center text-sm text-gray-500">
+          <p>KidVerse Safety Dashboard • Protecting your child&apos;s digital experience</p>
+          <p className="mt-1">
+            Showing {data.interactions.length} interactions, {data.alerts.length} active alerts
+          </p>
         </div>
       </div>
     </div>

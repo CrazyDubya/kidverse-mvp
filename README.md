@@ -70,7 +70,7 @@ kidverse-mvp/
    npm install
    ```
 
-4. Set up environment variables (see `.env.example` in each directory)
+4. Set up the backend environment: copy `backend/.env.example` to `backend/.env` and set `JWT_SECRET` (32+ characters, e.g. `openssl rand -hex 32`). The server refuses to start without it. You also need a MongoDB instance (`MONGODB_URI`).
 
 5. Start the development servers:
    
@@ -88,8 +88,10 @@ kidverse-mvp/
 
 ### Development
 
-- Frontend runs on `http://localhost:5173`
-- Backend API runs on `http://localhost:3000`
+- Frontend runs on `http://localhost:3000` and proxies `/api` and `/socket.io` to the backend, so no CORS setup is needed in development
+- Backend API runs on `http://localhost:5000`
+- Sign up as a parent in the UI, then create child accounts with `POST /api/auth/children`; children (or a monitoring client) report messages with `POST /api/interactions`
+- Tests: `npm test` in `backend/` and `frontend/`; `npm run lint` in each
 
 ### Contributing
 
