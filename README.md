@@ -90,7 +90,16 @@ kidverse-mvp/
 
 - Frontend runs on `http://localhost:3000` and proxies `/api` and `/socket.io` to the backend, so no CORS setup is needed in development
 - Backend API runs on `http://localhost:5000`
-- Sign up as a parent in the UI, then create child accounts with `POST /api/auth/children`; children (or a monitoring client) report messages with `POST /api/interactions`
+- Sign up as a parent in the UI, then use **Add child** on the dashboard to create child accounts (or `POST /api/auth/children`)
+- Messages reach the dashboard via `POST /api/interactions`. To feed it from the command line (or from your own monitoring code, which can call the same endpoint):
+  ```bash
+  cd backend
+  KIDVERSE_PASSWORD='the-child-password' node scripts/send-interaction.js \
+    --user kid_username --contact SomePlayer --message "where do you live?"
+  # many messages, one per line (plain text or JSON lines with message/contact/direction/timestamp):
+  KIDVERSE_PASSWORD=... node scripts/send-interaction.js --user kid_username --file chat.txt
+  ```
+  Risky messages raise an alert on the dashboard immediately. Use `--help` for all options; as a parent, pass `--child-id`.
 - Tests: `npm test` in `backend/` and `frontend/`; `npm run lint` in each
 
 ### Contributing

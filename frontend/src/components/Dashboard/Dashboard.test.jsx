@@ -20,23 +20,25 @@ const status = (overallStatus = 'critical', monitoringEnabled = true) => ({
   data: { overallStatus, lastUpdated: now(), statistics: { monitoringEnabled } }
 });
 
-let alerts, interactions;
+let alerts, interactions, children;
 const serve = ({ statusRes = status() } = {}) =>
   api.get.mockImplementation(async (url) => {
     if (url === '/status') return statusRes;
     if (url === '/alerts') return { data: { alerts } };
     if (url === '/interactions') return { data: { interactions } };
+    if (url === '/auth/children') return { data: { children } };
     throw new Error(`unexpected ${url}`);
   });
 
 beforeEach(() => {
   vi.clearAllMocks();
   socket.handlers = {};
-  alerts = [{ _id: 'a1', severity: 'critical', status: 'pending', createdAt: now(), description: 'Asked to meet in person', categories: ['off_platform_pressure:meetingRequests'] }];
+  alerts = [{ _id: 'a1', severity: 'critical', status: 'pending', createdAt: now(), description: 'Asked to meet in person', userId: 'c1', categories: ['off_platform_pressure:meetingRequests'] }];
   interactions = [
-    { _id: 'i1', message: 'meet me at the park', contact: 'FriendlyHelper', riskScore: 10, timestamp: now(), direction: 'incoming' },
+    { _id: 'i1', userId: 'c1', message: 'meet me at the park', contact: 'FriendlyHelper', riskScore: 10, timestamp: now(), direction: 'incoming' },
     { _id: 'i2', message: 'gg nice build', contact: 'BuilderPro', riskScore: 0, timestamp: now(), direction: 'incoming' }
   ];
+  children = [{ id: 'c1', firstName: 'Kit', lastName: 'Lee', username: 'kit_l', dateOfBirth: '2016-05-01' }];
   useAuth.setState({ token: 'tok', user: { id: 'p1', role: 'parent', firstName: 'Pat' } });
   serve();
 });
@@ -126,5 +128,78 @@ describe('Dashboard', () => {
     await screen.findByText('Asked to meet in person');
     unmount();
     expect(socket.disconnect).toHaveBeenCalled();
+  });
+
+  it('shows which child an alert and an interaction belong to', async () => {
+    render(<Dashboard />);
+    await screen.findByText('Asked to meet in person');
+    expect(screen.getAllByText(/Child: Kit/).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('Dashboard children', () => {
+  const fillAndSubmit = async (user) => {
+    await user.click(await screen.findByRole('button', { name: 'Add child' }));
+    await user.type(screen.getByLabelText('First name'), 'Sam');
+    await user.type(screen.getByLabelText('Last name'), 'Lee');
+    await user.type(screen.getByLabelText('Date of birth'), '2015-03-04');
+    await user.type(screen.getByLabelText('Username'), 'sam_l');
+    await user.type(screen.getByLabelText('Password'), 'Kid5!Password');
+    await user.click(screen.getByRole('button', { name: 'Create child account' }));
+  };
+
+  it('lists children with their age', async () => {
+    render(<Dashboard />);
+    expect(await screen.findByText('Kit Lee')).toBeInTheDocument();
+    expect(screen.getByText(/@kit_l/)).toBeInTheDocument();
+    expect(screen.getByText(/yrs/)).toBeInTheDocument();
+  });
+
+  it('creates a child, reloads the list and closes the form', async () => {
+    const user = userEvent.setup();
+    api.post.mockImplementation(async (url, body) => {
+      children = [...children, { id: 'c2', ...body }];
+      return { data: { success: true } };
+    });
+    render(<Dashboard />);
+    await fillAndSubmit(user);
+
+    expect(api.post).toHaveBeenCalledWith('/auth/children', {
+      firstName: 'Sam', lastName: 'Lee', dateOfBirth: '2015-03-04', username: 'sam_l', password: 'Kid5!Password'
+    });
+    expect(await screen.findByText('Sam Lee')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Create child account' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the form open and shows the server\'s reasons when creation fails', async () => {
+    const user = userEvent.setup();
+    api.post.mockRejectedValue({ response: { status: 409, data: { message: 'That username is not available' } } });
+    render(<Dashboard />);
+    await fillAndSubmit(user);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('That username is not available');
+    expect(screen.getByRole('button', { name: 'Create child account' })).toBeEnabled();
+    expect(screen.getByLabelText('Username')).toHaveValue('sam_l');
+  });
+
+  it('treats creation as successful even if the follow-up reload fails', async () => {
+    const user = userEvent.setup();
+    api.post.mockResolvedValue({ data: { success: true } });
+    render(<Dashboard />);
+    await screen.findByRole('button', { name: 'Add child' });
+    api.get.mockRejectedValue({ response: { status: 500, data: { message: 'reload broke' } } });
+    await fillAndSubmit(user);
+
+    // the form closed (the account exists; retrying would only hit "username taken") ...
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Create child account' })).not.toBeInTheDocument());
+    expect(api.post).toHaveBeenCalledTimes(1);
+    // ... and the reload problem is reported on its own, not as a failed creation
+    expect(await screen.findByRole('alert')).toHaveTextContent('reload broke');
+  });
+
+  it('explains the empty state', async () => {
+    children = [];
+    render(<Dashboard />);
+    expect(await screen.findByText(/No children added yet/)).toBeInTheDocument();
   });
 });

@@ -68,6 +68,7 @@ const AlertsPanel = ({ alerts, onReview }) => {
                     {alert.description}
                   </p>
                   <div className="flex items-center space-x-4 mt-2 text-xs text-gray-600">
+                    {alert.childName && <span>Child: {alert.childName}</span>}
                     <span>Platform: {alert.platform}</span>
                     <span>Severity: {alert.severity}</span>
                   </div>

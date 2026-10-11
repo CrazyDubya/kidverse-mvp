@@ -9,6 +9,12 @@ const query = (fn) => ({
   select() {
     return this;
   },
+  sort() {
+    return this;
+  },
+  lean() {
+    return this;
+  },
   then(resolve, reject) {
     return Promise.resolve().then(fn).then(resolve, reject);
   }
@@ -30,6 +36,7 @@ const makeStore = (extra = {}) => {
       return row;
     },
     findOne: (filter) => query(() => rows.find((r) => matches(r, filter)) || null),
+    find: (filter = {}) => query(() => rows.filter((r) => matches(r, filter))),
     findById: (id) => query(() => rows.find((r) => String(r._id) === String(id)) || null),
     findByIdAndUpdate: (id, update) =>
       query(() => {

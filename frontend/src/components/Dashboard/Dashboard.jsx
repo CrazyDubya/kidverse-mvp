@@ -4,6 +4,7 @@ import InteractionsList from './InteractionsList';
 import AlertsPanel from './AlertsPanel';
 import FilteringOptions from './FilteringOptions';
 import MonitoringIndicator from './MonitoringIndicator';
+import ChildrenPanel from './ChildrenPanel';
 import { useDashboardData } from '../../hooks/useDashboardData';
 import { useAuth } from '../../store/auth';
 
@@ -81,6 +82,7 @@ const Dashboard = () => {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="space-y-6">
               <AlertsPanel alerts={data.alerts} onReview={data.review} />
+              <ChildrenPanel kids={data.children} onCreate={data.createChild} />
             </div>
             <div className="space-y-6">
               <InteractionsList interactions={data.interactions.slice(0, 5)} />

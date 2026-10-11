@@ -106,7 +106,8 @@ const publicUser = (user) => ({
   firstName: user.firstName,
   lastName: user.lastName,
   role: user.role,
-  familyId: user.familyId ? user.familyId.toString() : undefined
+  familyId: user.familyId ? user.familyId.toString() : undefined,
+  isActive: user.isActive
 });
 
 const isDuplicateKey = (err) => err && err.code === 11000;
@@ -234,6 +235,25 @@ router.post('/children', authenticate, requireParent, validateCreateChild, async
       }
       throw err;
     }
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/auth/children  (parent only)
+ * The children in the caller's family.
+ */
+router.get('/children', authenticate, requireParent, async (req, res, next) => {
+  try {
+    if (!req.user.familyId) {
+      return res.status(400).json({ success: false, message: 'Your account is not part of a family' });
+    }
+    const children = await User.find({ familyId: req.user.familyId, role: 'child' }).sort({ createdAt: 1 }).lean();
+    res.json({
+      success: true,
+      children: children.map((c) => ({ ...publicUser(c), dateOfBirth: c.dateOfBirth }))
+    });
   } catch (err) {
     next(err);
   }
