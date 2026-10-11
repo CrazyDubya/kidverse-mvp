@@ -1,7 +1,6 @@
 const { body, param, query, validationResult } = require('express-validator');
 const mongoose = require('mongoose');
 const xss = require('xss');
-const DOMPurify = require('isomorphic-dompurify');
 
 /**
  * Handle validation errors middleware
@@ -14,8 +13,7 @@ const handleValidationErrors = (req, res, next) => {
       message: 'Validation failed',
       errors: errors.array().map(error => ({
         field: error.path || error.param,
-        message: error.msg,
-        value: error.value
+        message: error.msg
       }))
     });
   }
@@ -25,7 +23,10 @@ const handleValidationErrors = (req, res, next) => {
 /**
  * Sanitize input data
  */
+// Loaded lazily: it pulls in jsdom, which is slow to load and unnecessary for routes that don't sanitize
+let DOMPurify;
 const sanitizeInput = (req, res, next) => {
+  DOMPurify = DOMPurify || require('isomorphic-dompurify');
   const sanitizeValue = (value) => {
     if (typeof value === 'string') {
       // Remove XSS attempts and sanitize HTML

@@ -27,7 +27,7 @@ class SocketHandler {
         }
 
         // Verify JWT token
-        const decoded = await promisify(jwt.verify)(token, process.env.JWT_SECRET);
+        const decoded = await promisify(jwt.verify)(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
         
         // Get user from database
         const user = await User.findById(decoded.userId).select('-password');
