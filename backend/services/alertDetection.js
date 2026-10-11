@@ -238,7 +238,7 @@ class AlertDetectionService {
    * @param {Object} context - Additional context (sender age, recipient age, etc.)
    * @returns {Object} Detection result with risk score and details
    */
-  detectThreats(message, context = {}) {
+  detectThreats(message, _context = {}) {
     const results = {
       overallRisk: 0,
       confidence: 0,
@@ -373,7 +373,7 @@ class AlertDetectionService {
   applyContextEnhancers(message, baseRisk) {
     let enhancedRisk = baseRisk;
     
-    Object.entries(this.contextEnhancers).forEach(([enhancer, config]) => {
+    Object.values(this.contextEnhancers).forEach((config) => {
       const hasEnhancer = config.patterns.some(pattern => pattern.test(message));
       if (hasEnhancer) {
         enhancedRisk *= config.multiplier;
