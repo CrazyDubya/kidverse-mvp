@@ -182,6 +182,21 @@ describe('Dashboard children', () => {
     expect(screen.getByLabelText('Username')).toHaveValue('sam_l');
   });
 
+  it('treats creation as successful even if the follow-up reload fails', async () => {
+    const user = userEvent.setup();
+    api.post.mockResolvedValue({ data: { success: true } });
+    render(<Dashboard />);
+    await screen.findByRole('button', { name: 'Add child' });
+    api.get.mockRejectedValue({ response: { status: 500, data: { message: 'reload broke' } } });
+    await fillAndSubmit(user);
+
+    // the form closed (the account exists; retrying would only hit "username taken") ...
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Create child account' })).not.toBeInTheDocument());
+    expect(api.post).toHaveBeenCalledTimes(1);
+    // ... and the reload problem is reported on its own, not as a failed creation
+    expect(await screen.findByRole('alert')).toHaveTextContent('reload broke');
+  });
+
   it('explains the empty state', async () => {
     children = [];
     render(<Dashboard />);

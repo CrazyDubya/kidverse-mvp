@@ -58,7 +58,7 @@ function parseLines(text) {
     });
 }
 
-const isLocal = (url) => ['localhost', '127.0.0.1', '[::1]'].includes(new URL(url).hostname);
+const isLocal = (url) => ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
 
 async function run(argv, { env = process.env, fetchImpl = fetch, readFile = fs.readFileSync, log = console.log, err = console.error } = {}) {
   let args;
@@ -73,7 +73,7 @@ async function run(argv, { env = process.env, fetchImpl = fetch, readFile = fs.r
     return 0;
   }
 
-  const api = (args.api || env.KIDVERSE_API || 'http://localhost:5000').replace(/\/+$/, '');
+  const api = (args.api || env.KIDVERSE_API || 'http://localhost:5000').trim().replace(/\/+$/, '');
   const identifier = args.user || env.KIDVERSE_USER;
   const password = env.KIDVERSE_PASSWORD || args.password;
   if (!identifier || !password || (!args.message && !args.file)) {
@@ -97,13 +97,19 @@ async function run(argv, { env = process.env, fetchImpl = fetch, readFile = fs.r
     return 2;
   }
 
+  let apiUrl;
   try {
-    new URL(api);
+    apiUrl = new URL(api);
   } catch {
     err(`Invalid --api URL: ${api}`);
     return 2;
   }
-  if (api.startsWith('http://') && !isLocal(api)) {
+  if (!['http:', 'https:'].includes(apiUrl.protocol)) {
+    err(`--api must be an http(s) URL, got ${apiUrl.protocol}`);
+    return 2;
+  }
+  // Use the parsed protocol: "HTTP://host" and padded URLs are normalised by URL/fetch too
+  if (apiUrl.protocol === 'http:' && !isLocal(apiUrl)) {
     err('Warning: sending credentials over plain HTTP to a non-local host. Use https.');
   }
 

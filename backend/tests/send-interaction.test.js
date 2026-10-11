@@ -151,4 +151,16 @@ describe('usage and connectivity', () => {
     expect(r.errs).toContain('plain HTTP');
     expect(r.code).toBe(1);
   });
+
+  it('warns for upper/mixed-case or padded http URLs, but not for https or localhost', async () => {
+    for (const url of ['HTTP://example.invalid', ' Http://example.invalid ']) {
+      expect((await exec(['--api', url, '--user', 'kidc', '--message', 'hi'])).errs).toContain('plain HTTP');
+    }
+    expect((await exec(['--api', 'https://example.invalid', '--user', 'kidc', '--message', 'hi'])).errs).not.toContain('plain HTTP');
+    expect((await exec(['--api', 'HTTP://LOCALHOST:1', '--user', 'kidc', '--message', 'hi'])).errs).not.toContain('plain HTTP');
+  });
+
+  it('rejects non-http(s) schemes', async () => {
+    expect((await exec(['--api', 'ftp://example.invalid', '--user', 'kidc', '--message', 'hi'])).code).toBe(2);
+  });
 });
