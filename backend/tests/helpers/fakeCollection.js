@@ -71,6 +71,20 @@ const makeCollection = ({ defaults = () => ({}), unique = [] } = {}) => {
     findOne: (filter = {}) => chain(() => clone(match(filter)[0]) || null),
     findById: (id) => c.findOne({ _id: id }),
     countDocuments: async (filter = {}) => match(filter).length,
+    findByIdAndUpdate: (id, update) =>
+      chain(() => {
+        const row = match({ _id: id })[0];
+        if (!row) return null;
+        for (const [k, v] of Object.entries(update.$inc || {})) row[k] = (row[k] || 0) + v;
+        return clone(row);
+      }),
+    async updateOne(filter, update) {
+      const row = match(filter)[0];
+      if (!row) return { matchedCount: 0 };
+      for (const [k, v] of Object.entries(norm(update.$set || {}))) setPath(row, k, v);
+      for (const k of Object.keys(update.$unset || {})) delete row[k];
+      return { matchedCount: 1 };
+    },
     findOneAndUpdate: (filter, update, opts = {}) =>
       chain(() => {
         let row = match(filter)[0];

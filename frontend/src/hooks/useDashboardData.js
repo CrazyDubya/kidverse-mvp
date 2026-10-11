@@ -10,23 +10,25 @@ const REFRESH_MS = 60 * 1000;
 // `enabled` lets callers skip all network activity (e.g. for non-guardian accounts)
 export function useDashboardData(filters, enabled = true) {
   const token = useAuth((s) => s.token);
-  const [state, setState] = useState({ status: null, alerts: [], interactions: [], loading: enabled, error: null });
+  const [state, setState] = useState({ status: null, alerts: [], interactions: [], children: [], loading: enabled, error: null });
   const requestId = useRef(0);
 
   const load = useCallback(async () => {
     const id = ++requestId.current;
     try {
       const since = new Date(Date.now() - RANGE_MS[filters.timeRange]).toISOString();
-      const [status, alerts, interactions] = await Promise.all([
+      const [status, alerts, interactions, children] = await Promise.all([
         api.get('/status'),
         api.get('/alerts', { params: { limit: 100 } }),
-        api.get('/interactions', { params: { limit: 100, startDate: since } })
+        api.get('/interactions', { params: { limit: 100, startDate: since } }),
+        api.get('/auth/children')
       ]);
       if (id !== requestId.current) return; // a newer request superseded this one
       setState({
         status: status.data,
         alerts: alerts.data.alerts.map(mapAlert),
         interactions: interactions.data.interactions.map(mapInteraction),
+        children: children.data.children,
         loading: false,
         error: null
       });
@@ -70,19 +72,32 @@ export function useDashboardData(filters, enabled = true) {
     }
   }, []);
 
+  // Rejects on failure so the form can show the server's message
+  const createChild = useCallback(async (child) => {
+    await api.post('/auth/children', child);
+    toast.success(`Added ${child.firstName}`);
+    await loadRef.current();
+  }, []);
+
   const view = useMemo(() => {
+    const names = Object.fromEntries(state.children.map((c) => [c.id, c.firstName]));
+    const withName = (item) => ({ ...item, childName: names[item.childId] });
     const cutoff = Date.now() - RANGE_MS[filters.timeRange];
     const platformOk = (item) => filters.platform === 'all' || item.platform.toLowerCase() === filters.platform;
     return {
-      alerts: state.alerts.filter((a) => isOpenAlert(a) && platformOk(a) && new Date(a.timestamp).getTime() >= cutoff),
-      interactions: state.interactions.filter(
-        (i) => platformOk(i) && (filters.threatLevel === 'all' || i.threatLevel === filters.threatLevel)
-      )
+      alerts: state.alerts
+        .filter((a) => isOpenAlert(a) && platformOk(a) && new Date(a.timestamp).getTime() >= cutoff)
+        .map(withName),
+      interactions: state.interactions
+        .filter((i) => platformOk(i) && (filters.threatLevel === 'all' || i.threatLevel === filters.threatLevel))
+        .map(withName)
     };
-  }, [state.alerts, state.interactions, filters]);
+  }, [state.alerts, state.interactions, state.children, filters]);
 
   return {
     ...view,
+    children: state.children,
+    createChild,
     overallStatus: state.status ? mapOverallStatus(state.status.overallStatus) : 'safe',
     monitoringEnabled: state.status ? state.status.statistics.monitoringEnabled : true,
     lastUpdated: state.status ? state.status.lastUpdated : null,

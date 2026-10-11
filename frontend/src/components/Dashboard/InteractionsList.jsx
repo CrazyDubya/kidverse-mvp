@@ -46,6 +46,7 @@ const InteractionsList = ({ interactions }) => {
               </p>
               <p className="text-xs text-gray-500">
                 User: {interaction.username}
+                {interaction.childName && ` • Child: ${interaction.childName}`}
               </p>
             </div>
             <div className="text-right">

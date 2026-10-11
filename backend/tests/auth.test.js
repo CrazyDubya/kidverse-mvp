@@ -167,6 +167,34 @@ describe('POST /api/auth/children', () => {
   });
 });
 
+describe('GET /api/auth/children', () => {
+  const mkChild = (token, username) =>
+    request(app).post('/api/auth/children').set('Authorization', `Bearer ${token}`).send({
+      username, password: 'Kid5!Password', firstName: 'Kit', lastName: 'Parent', dateOfBirth: '2016-05-01'
+    });
+
+  it('lists only the caller\'s own family\'s children, without secrets', async () => {
+    const a = (await register()).body.token;
+    const b = (await register({ ...parent, email: 'other@example.com' })).body.token;
+    await mkChild(a, 'kid_a1');
+    await mkChild(a, 'kid_a2');
+    await mkChild(b, 'kid_b1');
+
+    const res = await request(app).get('/api/auth/children').set('Authorization', `Bearer ${a}`);
+    expect(res.status).toBe(200);
+    expect(res.body.children.map((c) => c.username)).toEqual(['kid_a1', 'kid_a2']);
+    expect(JSON.stringify(res.body)).not.toMatch(/passwordHash|\$2[aby]\$/);
+  });
+
+  it('requires a parent', async () => {
+    expect((await request(app).get('/api/auth/children')).status).toBe(401);
+    const a = (await register()).body.token;
+    await mkChild(a, 'kid_a1');
+    const childToken = (await login('kid_a1', 'Kid5!Password')).body.token;
+    expect((await request(app).get('/api/auth/children').set('Authorization', `Bearer ${childToken}`)).status).toBe(403);
+  });
+});
+
 describe('GET /api/auth/me', () => {
   it('returns the current user without secrets', async () => {
     const { token } = (await register()).body;

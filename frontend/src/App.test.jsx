@@ -19,6 +19,7 @@ beforeEach(() => {
   useAuth.setState({ token: null, user: null });
   api.get.mockImplementation(async (url) => {
     if (url === '/status') return { data: { overallStatus: 'safe', lastUpdated: new Date().toISOString(), statistics: { monitoringEnabled: true } } };
+    if (url === '/auth/children') return { data: { children: [] } };
     return { data: { alerts: [], interactions: [] } };
   });
 });
