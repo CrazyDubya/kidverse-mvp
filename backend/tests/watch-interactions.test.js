@@ -358,3 +358,33 @@ describe('rotation during an outage and checkpoint failures', () => {
     expect(messages.join('\n')).toMatch(/Stopping: .*ENOENT/);
   });
 });
+
+describe('untrustworthy progress files and in-place truncation', () => {
+  it.each([['not json {'], ['{"offset":-5}'], ['{"offset":"3"}'], ['']])('refuses to start with a corrupt progress file (%j)', async (content) => {
+    append('already there\nmore\n');
+    fs.writeFileSync(statePath, content);
+    const messages = [];
+    const code = await run(['--api', api, '--user', 'kidc', '--file', file, '--poll-ms', '50'], {
+      env: { KIDVERSE_PASSWORD: PW }, log: () => {}, err: (m) => messages.push(m), sleep: async () => {}
+    });
+    expect(code).toBe(1);
+    expect(messages.join('\n')).toMatch(/corrupt/);
+    expect(fs.readFileSync(statePath, 'utf8')).toBe(content); // left alone for the operator
+    expect(mockInteractions.rows).toHaveLength(0);
+  });
+
+  it('a missing progress file is just a first run', () => {
+    expect(() => make()).not.toThrow();
+  });
+
+  it('warns when the log is truncated in place', async () => {
+    append('aaaaaaaaaa\nbbbbbbbbbb\n');
+    const w = make({ fromStart: true });
+    await w.tick();
+    fs.truncateSync(file, 0);
+    append('after\n');
+    expect((await w.tick()).sent).toBe(1);
+    expect(errs.join('\n')).toMatch(/truncated in place/);
+    w.close();
+  });
+});

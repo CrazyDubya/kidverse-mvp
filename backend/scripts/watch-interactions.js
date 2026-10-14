@@ -62,13 +62,26 @@ const parseLine = (line) => {
   return parsed;
 };
 
+// A missing progress file is a first run. One that exists but can't be trusted is an error:
+// treating it as a first run would skip whatever hadn't been delivered yet.
 const loadState = (path) => {
+  let text;
   try {
-    const s = JSON.parse(fs.readFileSync(path, 'utf8'));
-    return Number.isInteger(s.offset) && s.offset >= 0 ? s : null;
-  } catch {
-    return null;
+    text = fs.readFileSync(path, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw new Error(`Cannot read the progress file ${path}: ${e.message}`);
   }
+  let s;
+  try {
+    s = JSON.parse(text);
+  } catch {
+    s = null;
+  }
+  if (!s || !Number.isInteger(s.offset) || s.offset < 0) {
+    throw new Error(`The progress file ${path} is corrupt. Fix or delete it (deleting skips what is already in the log).`);
+  }
+  return s;
 };
 
 // The bytes already consumed (first 64 at most). An append-only log never changes them, so a
@@ -210,7 +223,10 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
   const consume = async (result) => {
     const size = fs.fstatSync(handle.fd).size;
     if (size < state.offset || readHead(handle.fd, state.offset) !== (state.head || '')) {
-      state = { offset: 0, ino: handle.ino }; // truncated or rewritten in place
+      // Truncated or rewritten in place: the old bytes are gone, so anything not yet delivered
+      // from them is lost (rename-style rotation avoids this; see the README)
+      if (size < state.offset) err('The log was truncated in place; messages not yet delivered from it may be lost.');
+      state = { offset: 0, ino: handle.ino };
     }
     if (size === state.offset) return;
 
@@ -368,20 +384,26 @@ async function run(argv, { env = process.env, fetchImpl = fetch, log = console.l
     err('Warning: sending credentials over plain HTTP to a non-local host. Use https.');
   }
 
-  const watcher = createWatcher(
-    {
-      api,
-      identifier,
-      password,
-      file: args.file,
-      statePath: args.state || `${args.file}.kidverse-offset`,
-      fromStart: Boolean(args['from-start']),
-      defaults: { contact: args.contact, direction: args.direction },
-      childId: args['child-id'],
-      signal
-    },
-    { fetchImpl, log, err }
-  );
+  let watcher;
+  try {
+    watcher = createWatcher(
+      {
+        api,
+        identifier,
+        password,
+        file: args.file,
+        statePath: args.state || `${args.file}.kidverse-offset`,
+        fromStart: Boolean(args['from-start']),
+        defaults: { contact: args.contact, direction: args.direction },
+        childId: args['child-id'],
+        signal
+      },
+      { fetchImpl, log, err }
+    );
+  } catch (e) {
+    err(`Cannot start: ${e.message}`);
+    return 1;
+  }
 
   log(`Watching ${args.file} -> ${api}`);
   let backoff = pollMs;
