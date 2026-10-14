@@ -308,6 +308,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       seenMissing = true;
     }
 
+    let drained = false; // the previous file was fully read by this process before we moved on
     if (handle && (!stat || stat.ino !== handle.ino)) {
       // Rotated or deleted: finish the old file first (like tail -F), then move on. An
       // unterminated tail can never complete, so it is dropped with the file.
@@ -318,6 +319,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
         if (state.offset === before) break;
       }
       closeHandle();
+      drained = true;
     }
     if (!handle && (!stat || !openHandle())) return result;
 
@@ -328,7 +330,13 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       state = { ...(fromStart || seenMissing ? { offset: 0 } : startPosition(handle.fd, size)), ino: handle.ino };
       persist();
     } else if (state.ino !== handle.ino) {
-      state = { offset: 0, ino: handle.ino }; // a different file than the one we checkpointed
+      // A different file than the one we checkpointed. If we drained the old one ourselves that
+      // is a clean rotation; otherwise it was replaced while we were stopped, and whatever was
+      // still undelivered in it can no longer be read.
+      if (!drained && state.offset > 0) {
+        err('The log is a different file from the one last followed (rotated while the watcher was stopped?). Lines that were not yet delivered from the old file are not recovered.');
+      }
+      state = { offset: 0, ino: handle.ino };
     }
 
     await consume(result);

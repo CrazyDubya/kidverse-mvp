@@ -413,6 +413,26 @@ describe('untrustworthy progress files and in-place truncation', () => {
     w.close();
   });
 
+  it('warns when the log was replaced while the watcher was stopped, but not after a clean rotation', async () => {
+    append('one\ntwo\n');
+    const first = make({ fromStart: true });
+    await first.tick();
+    first.close();
+
+    fs.renameSync(file, `${file}.1`);
+    append('three\n');
+    const restarted = make();
+    expect((await restarted.tick()).sent).toBe(1);
+    expect(errs.join('\n')).toMatch(/rotated while the watcher was stopped/);
+    errs.length = 0;
+
+    fs.renameSync(file, `${file}.2`); // rotation while running: drained, so no warning
+    append('four\n');
+    expect((await restarted.tick()).sent).toBe(1);
+    expect(errs.join('\n')).not.toMatch(/rotated while the watcher was stopped/);
+    restarted.close();
+  });
+
   it('a missing progress file is just a first run', () => {
     expect(() => make()).not.toThrow();
   });
