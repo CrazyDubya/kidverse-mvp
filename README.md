@@ -91,6 +91,7 @@ kidverse-mvp/
 - Frontend runs on `http://localhost:3000` and proxies `/api` and `/socket.io` to the backend, so no CORS setup is needed in development
 - Backend API runs on `http://localhost:5000`
 - Sign up as a parent in the UI, then use **Add child** on the dashboard to create child accounts (or `POST /api/auth/children`)
+- **Manage children** from the same panel: *Reset password* (also unlocks the account) and *Deactivate* / *Reactivate*. Either signs the child out everywhere immediately, including live connections (sessions carry a token version that these actions bump). API: `PATCH /api/auth/children/:id/status`, `POST /api/auth/children/:id/password`
 - Messages reach the dashboard via `POST /api/interactions`. To feed it from the command line (or from your own monitoring code, which can call the same endpoint):
   ```bash
   cd backend

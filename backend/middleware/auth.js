@@ -39,6 +39,14 @@ const authenticate = async (req, res, next) => {
       });
     }
 
+    // Tokens issued before a password reset / reactivation are no longer valid
+    if ((decoded.tv || 0) !== (user.tokenVersion || 0)) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session is no longer valid. Please sign in again.'
+      });
+    }
+
     // Attach user to request
     req.user = user;
     next();

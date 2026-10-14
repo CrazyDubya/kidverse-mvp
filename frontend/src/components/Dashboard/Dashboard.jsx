@@ -82,7 +82,12 @@ const Dashboard = () => {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="space-y-6">
               <AlertsPanel alerts={data.alerts} onReview={data.review} />
-              <ChildrenPanel kids={data.children} onCreate={data.createChild} />
+              <ChildrenPanel
+                kids={data.children}
+                onCreate={data.createChild}
+                onSetActive={data.setChildActive}
+                onResetPassword={data.resetChildPassword}
+              />
             </div>
             <div className="space-y-6">
               <InteractionsList interactions={data.interactions.slice(0, 5)} />

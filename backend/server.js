@@ -13,6 +13,8 @@ dotenv.config();
 
 const dashboardRoutes = require('./routes/dashboard');
 const authRoutes = require('./routes/auth');
+const User = require('./models/User');
+const { authenticate } = require('./middleware/auth');
 
 // Initialize Express app
 const app = express();
@@ -108,27 +110,24 @@ const extractBearer = (header) => {
   return scheme === 'Bearer' && token ? token : null;
 };
 
-const authenticateToken = (req, res, next) => {
-  const token = extractBearer(req.headers.authorization);
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'Access token required' });
-  }
-
-  try {
-    req.user = verifyToken(token);
-    next();
-  } catch (error) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
-  }
+// A valid signature isn't enough: the account must still be active and the token's version
+// current (bumped on password reset and on deactivation/reactivation).
+const isSessionCurrent = async (claims) => {
+  const account = await User.findById(claims.userId).select('isActive tokenVersion').lean();
+  return Boolean(account && account.isActive && (claims.tv || 0) === (account.tokenVersion || 0));
 };
 
-// Optional authentication (doesn't fail if no token)
-const optionalAuth = (req, res, next) => {
+// Optional authentication (doesn't fail if there is no valid session)
+const optionalAuth = async (req, res, next) => {
+  req.user = null;
   const token = extractBearer(req.headers.authorization);
-  try {
-    req.user = token ? verifyToken(token) : null;
-  } catch (error) {
-    req.user = null;
+  if (token) {
+    try {
+      const claims = verifyToken(token);
+      if (claims.userId && (await isSessionCurrent(claims))) req.user = claims;
+    } catch (error) {
+      // invalid, expired or revoked: treated as anonymous
+    }
   }
   next();
 };
@@ -153,7 +152,7 @@ const escapeHtml = (str) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token || extractBearer(socket.handshake.headers.authorization);
   if (!token) {
     return next(new Error('Authentication required'));
@@ -164,7 +163,11 @@ io.use((socket, next) => {
     if (!decoded.userId) {
       return next(new Error('Invalid authentication token'));
     }
+    if (!(await isSessionCurrent(decoded))) {
+      return next(new Error('Invalid authentication token'));
+    }
     socket.user = decoded;
+    socket.data.userId = String(decoded.userId); // lets the API find and drop this user's sockets
     next();
   } catch (error) {
     return next(new Error('Invalid authentication token'));
@@ -181,14 +184,51 @@ io.on('connection', (socket) => {
   const scope = user.familyId ? `family_${user.familyId}` : `user_${user.userId}`;
   socket.join(scope);
 
-  activeUsers.set(socket.id, publicUser);
-  socket.to(scope).emit('user:online', publicUser);
+  // Close the handshake/revocation race: access may have been revoked after the handshake read
+  // the account but before this socket was in its room, where the revoking request's
+  // disconnect scan could not see it. Re-check now that it is discoverable; any revocation
+  // after this read is guaranteed to find the socket.
+  const verified = isSessionCurrent(user)
+    .catch(() => false)
+    .then((ok) => {
+      if (!ok) socket.disconnect(true);
+      return ok;
+    });
+
+  // Event handlers wait for that check (in arrival order), so a revoked session can't act
+  // while it is pending, and legitimate early events aren't lost.
+  const on = (event, handler) =>
+    socket.on(event, (...args) => {
+      verified.then((ok) => {
+        if (ok) handler(...args);
+      });
+    });
+
+  // Safety net: the API's disconnect sweep is best-effort (adapter errors, a crash between the
+  // database write and the sweep), so each socket also re-validates itself periodically. This
+  // bounds how long a revoked session can linger. A transient database error keeps the
+  // socket and tries again next tick rather than dropping every client on a blip.
+  const revalidateMs = Number(process.env.SOCKET_REVALIDATE_MS) || 60 * 1000;
+  const revalidateTimer = setInterval(() => {
+    isSessionCurrent(user)
+      .then((ok) => {
+        if (!ok) socket.disconnect(true);
+      })
+      .catch((err) => console.error('Socket re-validation failed:', err.message));
+  }, revalidateMs);
+  revalidateTimer.unref();
+
+  verified.then((ok) => {
+    if (!ok || !socket.connected) return;
+    activeUsers.set(socket.id, publicUser);
+    socket.to(scope).emit('user:online', publicUser);
+  });
 
   // Simple per-socket chat flood control
   let windowStart = Date.now();
   let sentInWindow = 0;
 
-  socket.on('chat:message', (data) => {
+  on('chat:message', (data) => {
     if (!data || typeof data.message !== 'string') {
       socket.emit('error', { message: 'Invalid message format' });
       return;
@@ -218,7 +258,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('game:join', (gameData) => {
+  on('game:join', (gameData) => {
     const roomId = gameData && gameData.roomId;
     if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
       socket.emit('error', { message: 'Invalid room ID' });
@@ -233,7 +273,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('game:action', (actionData) => {
+  on('game:action', (actionData) => {
     const roomId = actionData && actionData.roomId;
     if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) return;
     const room = `game_${roomId}`;
@@ -248,6 +288,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    clearInterval(revalidateTimer);
     const userData = activeUsers.get(socket.id);
     if (userData) {
       socket.to(scope).emit('user:offline', userData);
@@ -298,26 +339,26 @@ app.get('/api', (req, res) => {
 
 // Register API routes
 // app.use('/api/auth', authRoutes);
-// app.use('/api/users', authenticateToken, userRoutes);
-// app.use('/api/games', authenticateToken, gameRoutes);
+// app.use('/api/users', authenticate, userRoutes);
+// app.use('/api/games', authenticate, gameRoutes);
 // app.use('/api/content', optionalAuth, contentRoutes);
-// app.use('/api/parents', authenticateToken, parentRoutes);
+// app.use('/api/parents', authenticate, parentRoutes);
 
 // Placeholder routes (remove when actual routes are implemented)
 app.use('/api/auth', authRoutes);
 
-app.use('/api/users', authenticateToken, (req, res) => {
+app.use('/api/users', authenticate, (req, res) => {
   // SECURITY FIX: Don't expose full user object, only safe fields
   res.status(200).json({
     message: 'User routes - authenticated',
     user: {
-      id: req.user.userId,
+      id: String(req.user._id),
       role: req.user.role
     }
   });
 });
 
-app.use('/api/games', authenticateToken, (req, res) => {
+app.use('/api/games', authenticate, (req, res) => {
   res.status(200).json({ message: 'Game routes - to be implemented' });
 });
 
@@ -325,7 +366,7 @@ app.use('/api/content', optionalAuth, (req, res) => {
   res.status(200).json({ message: 'Content routes - to be implemented' });
 });
 
-app.use('/api/parents', authenticateToken, (req, res) => {
+app.use('/api/parents', authenticate, (req, res) => {
   res.status(200).json({ message: 'Parent routes - to be implemented' });
 });
 

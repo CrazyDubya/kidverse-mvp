@@ -22,6 +22,8 @@ const userSchema = new mongoose.Schema(
     familyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Family', index: true },
     dateOfBirth: { type: Date },
     isActive: { type: Boolean, default: true },
+    // Bumped on password reset and (de)activation; tokens carry it, so older ones stop working
+    tokenVersion: { type: Number, default: 0 },
     failedLoginAttempts: { type: Number, default: 0, select: false },
     lockUntil: { type: Date, select: false }
   },

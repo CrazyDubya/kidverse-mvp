@@ -8,7 +8,7 @@ import { connectSocket } from '../../api/socket';
 
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal()),
-  api: { get: vi.fn(), post: vi.fn() }
+  api: { get: vi.fn(), post: vi.fn(), patch: vi.fn() }
 }));
 
 const socket = { handlers: {}, on: vi.fn(), off: vi.fn(), disconnect: vi.fn() };
@@ -195,6 +195,74 @@ describe('Dashboard children', () => {
     expect(api.post).toHaveBeenCalledTimes(1);
     // ... and the reload problem is reported on its own, not as a failed creation
     expect(await screen.findByRole('alert')).toHaveTextContent('reload broke');
+  });
+
+  describe('managing an existing child', () => {
+    it('asks for confirmation before deactivating, and nothing happens on cancel', async () => {
+      const user = userEvent.setup();
+      render(<Dashboard />);
+      await user.click(await screen.findByRole('button', { name: 'Deactivate Kit' }));
+      expect(screen.getByText(/Deactivate Kit\?/)).toBeInTheDocument();
+      expect(api.patch).not.toHaveBeenCalled();
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(api.patch).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: 'Deactivate Kit' })).toBeInTheDocument();
+    });
+
+    it('deactivates after confirmation, then shows the child as inactive with a way back', async () => {
+      const user = userEvent.setup();
+      api.patch.mockImplementation(async (url, body) => {
+        children = children.map((c) => ({ ...c, isActive: body.isActive }));
+        return { data: { success: true } };
+      });
+      render(<Dashboard />);
+      await user.click(await screen.findByRole('button', { name: 'Deactivate Kit' }));
+      await user.click(screen.getByRole('button', { name: 'Confirm deactivate' }));
+
+      expect(api.patch).toHaveBeenCalledWith('/auth/children/c1/status', { isActive: false });
+      expect(await screen.findByText('Inactive')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Deactivate Kit' })).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Reactivate Kit' }));
+      expect(api.patch).toHaveBeenLastCalledWith('/auth/children/c1/status', { isActive: true });
+      await waitFor(() => expect(screen.queryByText('Inactive')).not.toBeInTheDocument());
+    });
+
+    it('leaves the child active if deactivation fails', async () => {
+      const user = userEvent.setup();
+      api.patch.mockRejectedValue({ response: { status: 500, data: { message: 'nope' } } });
+      render(<Dashboard />);
+      await user.click(await screen.findByRole('button', { name: 'Deactivate Kit' }));
+      await user.click(screen.getByRole('button', { name: 'Confirm deactivate' }));
+
+      await waitFor(() => expect(api.patch).toHaveBeenCalled());
+      expect(screen.queryByText('Inactive')).not.toBeInTheDocument();
+    });
+
+    it('resets a password and closes the form', async () => {
+      const user = userEvent.setup();
+      api.post.mockResolvedValue({ data: { success: true } });
+      render(<Dashboard />);
+      await user.click(await screen.findByRole('button', { name: 'Reset password for Kit' }));
+      await user.type(screen.getByLabelText('New password for Kit'), 'Brand9!NewPass');
+      await user.click(screen.getByRole('button', { name: 'Save password' }));
+
+      expect(api.post).toHaveBeenCalledWith('/auth/children/c1/password', { password: 'Brand9!NewPass' });
+      await waitFor(() => expect(screen.queryByLabelText('New password for Kit')).not.toBeInTheDocument());
+    });
+
+    it('keeps the reset form open and explains why when the password is rejected', async () => {
+      const user = userEvent.setup();
+      api.post.mockRejectedValue({ response: { status: 400, data: { errors: [{ message: 'Password must contain a number' }] } } });
+      render(<Dashboard />);
+      await user.click(await screen.findByRole('button', { name: 'Reset password for Kit' }));
+      await user.type(screen.getByLabelText('New password for Kit'), 'Weakpass!');
+      await user.click(screen.getByRole('button', { name: 'Save password' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Password must contain a number');
+      expect(screen.getByLabelText('New password for Kit')).toHaveValue('Weakpass!');
+    });
   });
 
   it('explains the empty state', async () => {

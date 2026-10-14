@@ -50,6 +50,7 @@ const makeStore = (extra = {}) => {
       const row = rows.find((r) => matches(r, filter));
       if (!row) return { matchedCount: 0 };
       Object.assign(row, update.$set || {});
+      for (const [k, v] of Object.entries(update.$inc || {})) row[k] = (row[k] || 0) + v;
       for (const k of Object.keys(update.$unset || {})) delete row[k];
       return { matchedCount: 1 };
     },

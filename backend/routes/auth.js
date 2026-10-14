@@ -28,11 +28,14 @@ const authLimiter = rateLimit({
 
 // ---------- validators ----------
 
-// bcrypt ignores everything past 72 bytes, so cap it
+// bcrypt silently ignores everything past 72 *bytes* (not characters), so a longer password
+// would be truncated and a different one sharing its first 72 bytes would also log in
 const passwordRule = body('password')
   .isString()
   .isLength({ min: 8, max: 72 })
   .withMessage('Password must be 8-72 characters')
+  .custom((value) => Buffer.byteLength(value, 'utf8') <= 72)
+  .withMessage('Password is too long (72 bytes maximum; symbols and emoji count for more than one)')
   .matches(/[a-z]/)
   .withMessage('Password must contain a lowercase letter')
   .matches(/[A-Z]/)
@@ -93,7 +96,8 @@ const signToken = (user) =>
       userId: user._id.toString(),
       role: user.role,
       familyId: user.familyId ? user.familyId.toString() : undefined,
-      username: user.username || user.firstName
+      username: user.username || user.firstName,
+      tv: user.tokenVersion || 0
     },
     process.env.JWT_SECRET,
     { algorithm: 'HS256', expiresIn: process.env.JWT_EXPIRES_IN || '1h' }
@@ -111,6 +115,28 @@ const publicUser = (user) => ({
 });
 
 const isDuplicateKey = (err) => err && err.code === 11000;
+
+// mongoose's ObjectId.isValid() accepts any 12-character string; be strict
+const OBJECT_ID = /^[a-fA-F0-9]{24}$/;
+
+// A parent can only manage children in their own family; anything else looks like "not found"
+const findOwnChild = (req) =>
+  OBJECT_ID.test(req.params.id)
+    ? User.findOne({ _id: req.params.id, familyId: req.user.familyId, role: 'child' }).lean()
+    : null;
+
+// Drop live sockets for a user whose access just changed
+const disconnectUser = async (req, user) => {
+  const io = req.app.get('io');
+  if (!io || !io.in) return;
+  try {
+    for (const socket of await io.in(`family_${user.familyId}`).fetchSockets()) {
+      if (socket.data && socket.data.userId === String(user._id)) socket.disconnect(true);
+    }
+  } catch (err) {
+    console.error('Could not disconnect sockets:', err.message);
+  }
+};
 
 // ---------- routes ----------
 
@@ -258,6 +284,69 @@ router.get('/children', authenticate, requireParent, async (req, res, next) => {
     next(err);
   }
 });
+
+/**
+ * PATCH /api/auth/children/:id/status  (parent only)
+ * { isActive: boolean }. Deactivating blocks sign-in and API access immediately and drops
+ * live sockets; the token version is bumped both ways so old tokens never come back to life.
+ */
+router.patch('/children/:id/status', authenticate, requireParent, async (req, res, next) => {
+  try {
+    const { isActive } = req.body || {};
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'isActive must be true or false' });
+    }
+    if (!OBJECT_ID.test(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid child id' });
+    }
+    const child = await findOwnChild(req);
+    if (!child) return res.status(404).json({ success: false, message: 'Child not found' });
+
+    await User.updateOne({ _id: child._id }, { $set: { isActive }, $inc: { tokenVersion: 1 } });
+    // Every update bumps the token version, so live sockets (which don't revalidate per event)
+    // must go too, whichever direction the change went
+    await disconnectUser(req, child);
+
+    res.json({ success: true, user: { ...publicUser(child), isActive } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/auth/children/:id/password  (parent only)
+ * { password }. Also unlocks the account and signs the child out everywhere.
+ */
+router.post(
+  '/children/:id/password',
+  authenticate,
+  requireParent,
+  [passwordRule, handleValidationErrors],
+  async (req, res, next) => {
+    try {
+      if (!OBJECT_ID.test(req.params.id)) {
+        return res.status(400).json({ success: false, message: 'Invalid child id' });
+      }
+      const child = await findOwnChild(req);
+      if (!child) return res.status(404).json({ success: false, message: 'Child not found' });
+
+      const passwordHash = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+      await User.updateOne(
+        { _id: child._id },
+        {
+          $set: { passwordHash, failedLoginAttempts: 0 },
+          $unset: { lockUntil: 1 },
+          $inc: { tokenVersion: 1 }
+        }
+      );
+      await disconnectUser(req, child);
+
+      res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 /**
  * GET /api/auth/me

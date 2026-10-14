@@ -79,6 +79,23 @@ export function useDashboardData(filters, enabled = true) {
     await loadRef.current();
   }, []);
 
+  // Failures surface as a toast: there's no form to attach them to
+  const setChildActive = useCallback(async (id, isActive) => {
+    try {
+      await api.patch(`/auth/children/${id}/status`, { isActive });
+      toast.success(isActive ? 'Account reactivated' : 'Account deactivated');
+      await loadRef.current();
+    } catch (err) {
+      toast.error(errorMessage(err, 'Could not update the account.'));
+    }
+  }, []);
+
+  // Rejects on failure so the inline form can show the server's reasons
+  const resetChildPassword = useCallback(async (id, password) => {
+    await api.post(`/auth/children/${id}/password`, { password });
+    toast.success('Password updated; they have been signed out everywhere');
+  }, []);
+
   const view = useMemo(() => {
     const names = Object.fromEntries(state.children.map((c) => [c.id, c.firstName]));
     const withName = (item) => ({ ...item, childName: names[item.childId] });
@@ -98,6 +115,8 @@ export function useDashboardData(filters, enabled = true) {
     ...view,
     children: state.children,
     createChild,
+    setChildActive,
+    resetChildPassword,
     overallStatus: state.status ? mapOverallStatus(state.status.overallStatus) : 'safe',
     monitoringEnabled: state.status ? state.status.statistics.monitoringEnabled : true,
     lastUpdated: state.status ? state.status.lastUpdated : null,
