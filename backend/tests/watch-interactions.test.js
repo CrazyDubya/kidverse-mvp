@@ -253,3 +253,49 @@ describe('edge cases found in review', () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 });
+
+describe('edge cases found in the second review', () => {
+  it('drops an oversized unterminated line found at startup, through its newline', async () => {
+    append('y'.repeat(70 * 1024));
+    const w = make();
+    expect((await w.tick()).sent).toBe(0);
+    append('rest of the huge line\nnext\n');
+    expect((await w.tick()).sent).toBe(1);
+    expect(mockInteractions.rows.map((x) => x.message)).toEqual(['next']);
+  });
+
+  it('gives up on a stalled server and retries instead of hanging', async () => {
+    append('hello\n');
+    const stalled = (url, init) =>
+      new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('timed out'))));
+    const w = make({ fromStart: true, timeoutMs: 100 }, { fetchImpl: stalled });
+    expect(await w.tick()).toMatchObject({ sent: 0, retry: true });
+  });
+
+  it('stops an in-flight request when shutting down', async () => {
+    append('hello\n');
+    const controller = new AbortController();
+    const stalled = (url, init) =>
+      new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    const w = make({ fromStart: true, signal: controller.signal }, { fetchImpl: stalled });
+    const pending = w.tick();
+    setTimeout(() => controller.abort(), 50);
+    expect(await pending).toMatchObject({ retry: true });
+  });
+
+  it('treats a file that vanishes between stat and open as missing', async () => {
+    append('hello\n');
+    const w = make({ fromStart: true });
+    const realOpen = fs.openSync;
+    const spy = jest.spyOn(fs, 'openSync').mockImplementation((p, ...rest) => {
+      if (p === file) throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+      return realOpen(p, ...rest);
+    });
+    try {
+      expect(await w.tick()).toMatchObject({ sent: 0, retry: false });
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await w.tick()).sent).toBe(1); // and it carries on afterwards
+  });
+});

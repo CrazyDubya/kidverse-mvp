@@ -36,6 +36,7 @@ const BOOL_FLAGS = ['from-start'];
 const MAX_CHUNK = 1024 * 1024;
 const MAX_LINE = 64 * 1024;
 const MAX_BACKOFF_MS = 60 * 1000;
+const REQUEST_TIMEOUT_MS = 30 * 1000;
 
 function parseArgs(argv) {
   const args = {};
@@ -88,10 +89,10 @@ const readHead = (file, offset) => {
 
 // Offset just past the last newline, so a line still being written at startup is delivered whole
 // once finished instead of as a fragment. With no newline in view, a small file is one line in
-// progress (start at 0); a huge one is junk (start at the end).
-const startOffset = (file, size) => {
+// progress (start at 0); a huge one is junk: start at the end and drop it through its newline.
+const startPosition = (file, size) => {
   const length = Math.min(size, MAX_LINE);
-  if (length === 0) return 0;
+  if (length === 0) return { offset: 0 };
   const buf = Buffer.alloc(length);
   const fd = fs.openSync(file, 'r');
   try {
@@ -100,8 +101,8 @@ const startOffset = (file, size) => {
     fs.closeSync(fd);
   }
   const nl = buf.lastIndexOf(0x0a);
-  if (nl !== -1) return size - length + nl + 1;
-  return size <= MAX_LINE ? 0 : size;
+  if (nl !== -1) return { offset: size - length + nl + 1 };
+  return size <= MAX_LINE ? { offset: 0 } : { offset: size, skipping: true };
 };
 
 const saveState = (path, state) => {
@@ -115,7 +116,7 @@ const saveState = (path, state) => {
  * { sent, skipped, retry }: retry is true when delivery should be attempted again after a delay.
  */
 function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = console.error } = {}) {
-  const { api, identifier, password, file, statePath, fromStart, defaults = {}, childId } = opts;
+  const { api, identifier, password, file, statePath, fromStart, defaults = {}, childId, signal, timeoutMs = REQUEST_TIMEOUT_MS } = opts;
   let token = null;
   let state = loadState(statePath); // { offset, ino, head }
   let seenMissing = false;
@@ -129,7 +130,9 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     fetchImpl(`${api}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      // A stalled server must not hang the watcher or block shutdown
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
     });
 
   // Returns true when signed in; 'fatal' for bad credentials (retrying only locks the account)
@@ -188,7 +191,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     return 'retry';
   };
 
-  const tick = async () => {
+  const tickOnce = async () => {
     const result = { sent: 0, skipped: 0, retry: false, fatal: false };
     let stat;
     try {
@@ -201,7 +204,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     if (!state) {
       // First run: by default ignore history so old messages aren't replayed as new, unless the
       // file only appeared after we started watching, in which case all of it is new
-      state = { offset: fromStart || seenMissing ? 0 : startOffset(file, stat.size), ino: stat.ino };
+      state = { ...(fromStart || seenMissing ? { offset: 0 } : startPosition(file, stat.size)), ino: stat.ino };
       persist();
     }
     if (stat.ino !== state.ino || stat.size < state.offset || readHead(file, state.offset) !== (state.head || '')) {
@@ -273,6 +276,17 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     return result;
   };
 
+  // The producer may rotate or delete the file between any two of our reads: treat as "missing"
+  const tick = async () => {
+    try {
+      return await tickOnce();
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      seenMissing = true;
+      return { sent: 0, skipped: 0, retry: false, fatal: false };
+    }
+  };
+
   return { tick, log };
 }
 
@@ -341,7 +355,8 @@ async function run(argv, { env = process.env, fetchImpl = fetch, log = console.l
       statePath: args.state || `${args.file}.kidverse-offset`,
       fromStart: Boolean(args['from-start']),
       defaults: { contact: args.contact, direction: args.direction },
-      childId: args['child-id']
+      childId: args['child-id'],
+      signal
     },
     { fetchImpl, log, err }
   );
