@@ -270,4 +270,66 @@ describe('revocation is enforced everywhere', () => {
       mockUsers.findById = realFindById;
     }
   });
+
+  it('ignores events from a socket while its session re-check is still pending', async () => {
+    // Same race, but make the re-check slow so the revoked client can try to act in the gap
+    const sibling = await open(tokenFor(kidA2)); // connected before the hooks are installed
+    const heard = collect(sibling, 'chat:message');
+    await settle();
+    const realFindById = mockUsers.findById;
+    let handshakeSeen = false;
+    let revokedYet = false;
+    let slowedRecheck = false;
+    const chain = (real, after) => {
+      const q = { select: () => q, lean: () => q, then: (resolve, reject) => real.then(after).then(resolve, reject) };
+      return q;
+    };
+    mockUsers.findById = (id) => {
+      const real = realFindById(id);
+      if (!handshakeSeen) {
+        // the handshake: hand it the stale snapshot, then revoke
+        handshakeSeen = true;
+        return chain(real, async (snapshot) => {
+          expect((await patchStatus(kidA1._id, false)).status).toBe(200);
+          revokedYet = true;
+          return snapshot;
+        });
+      }
+      if (revokedYet && !slowedRecheck) {
+        // the first lookup after the revocation is the socket's re-check: make it slow
+        slowedRecheck = true;
+        return chain(real, (r) => new Promise((done) => setTimeout(() => done(r), 400)));
+      }
+      return real;
+    };
+
+    try {
+      const revoked = await open(tokenFor(kidA1));
+      expect(revoked).not.toBeInstanceOf(Error);
+      revoked.emit('chat:message', { message: 'sent while the re-check was pending' });
+      expect(await within(closed(revoked), 3000)).toBe(true);
+      await settle();
+      expect(heard).toHaveLength(0);
+    } finally {
+      mockUsers.findById = realFindById;
+    }
+  });
+
+  it('does not lose events a legitimate client sends right after connecting', async () => {
+    const sibling = await open(tokenFor(kidA2));
+    const heard = collect(sibling, 'chat:message');
+    const s = await open(tokenFor(kidA1));
+    s.emit('chat:message', { message: 'first' });
+    s.emit('chat:message', { message: 'second' });
+    await settle(400);
+    expect(heard.map((m) => m.message)).toEqual(['first', 'second']);
+  });
+
+  it('drops live sockets on any status update, even a redundant one', async () => {
+    const child = await open(tokenFor(kidA1));
+    const gone = closed(child);
+    // already active: the update still bumps the token version, so the session must end
+    expect((await patchStatus(kidA1._id, true)).status).toBe(200);
+    expect(await within(gone, 2000)).toBe(true);
+  });
 });

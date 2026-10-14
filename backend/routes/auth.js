@@ -300,7 +300,9 @@ router.patch('/children/:id/status', authenticate, requireParent, async (req, re
     if (!child) return res.status(404).json({ success: false, message: 'Child not found' });
 
     await User.updateOne({ _id: child._id }, { $set: { isActive }, $inc: { tokenVersion: 1 } });
-    if (!isActive) await disconnectUser(req, child);
+    // Every update bumps the token version, so live sockets (which don't revalidate per event)
+    // must go too, whichever direction the change went
+    await disconnectUser(req, child);
 
     res.json({ success: true, user: { ...publicUser(child), isActive } });
   } catch (err) {

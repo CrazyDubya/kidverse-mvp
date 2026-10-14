@@ -188,20 +188,33 @@ io.on('connection', (socket) => {
   // the account but before this socket was in its room, where the revoking request's
   // disconnect scan could not see it. Re-check now that it is discoverable; any revocation
   // after this read is guaranteed to find the socket.
-  isSessionCurrent(user)
-    .then((current) => {
-      if (!current) socket.disconnect(true);
-    })
-    .catch(() => socket.disconnect(true));
+  const verified = isSessionCurrent(user)
+    .catch(() => false)
+    .then((ok) => {
+      if (!ok) socket.disconnect(true);
+      return ok;
+    });
 
-  activeUsers.set(socket.id, publicUser);
-  socket.to(scope).emit('user:online', publicUser);
+  // Event handlers wait for that check (in arrival order), so a revoked session can't act
+  // while it is pending, and legitimate early events aren't lost.
+  const on = (event, handler) =>
+    socket.on(event, (...args) => {
+      verified.then((ok) => {
+        if (ok) handler(...args);
+      });
+    });
+
+  verified.then((ok) => {
+    if (!ok || !socket.connected) return;
+    activeUsers.set(socket.id, publicUser);
+    socket.to(scope).emit('user:online', publicUser);
+  });
 
   // Simple per-socket chat flood control
   let windowStart = Date.now();
   let sentInWindow = 0;
 
-  socket.on('chat:message', (data) => {
+  on('chat:message', (data) => {
     if (!data || typeof data.message !== 'string') {
       socket.emit('error', { message: 'Invalid message format' });
       return;
@@ -231,7 +244,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('game:join', (gameData) => {
+  on('game:join', (gameData) => {
     const roomId = gameData && gameData.roomId;
     if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
       socket.emit('error', { message: 'Invalid room ID' });
@@ -246,7 +259,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('game:action', (actionData) => {
+  on('game:action', (actionData) => {
     const roomId = actionData && actionData.roomId;
     if (typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) return;
     const room = `game_${roomId}`;
