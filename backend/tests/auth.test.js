@@ -195,6 +195,109 @@ describe('GET /api/auth/children', () => {
   });
 });
 
+describe('managing children', () => {
+  const CHILD_PW = 'Kid5!Password';
+  const authz = (token) => ({ Authorization: `Bearer ${token}` });
+  let parentToken;
+  let otherToken;
+  let childId;
+  let childToken;
+
+  const setStatus = (token, id, body) => request(app).patch(`/api/auth/children/${id}/status`).set(authz(token)).send(body);
+  const resetPassword = (token, id, password) =>
+    request(app).post(`/api/auth/children/${id}/password`).set(authz(token)).send({ password });
+  const me = (token) => request(app).get('/api/auth/me').set(authz(token));
+
+  beforeEach(async () => {
+    parentToken = (await register()).body.token;
+    otherToken = (await register({ ...parent, email: 'other@example.com' })).body.token;
+    const created = await request(app).post('/api/auth/children').set(authz(parentToken)).send({
+      username: 'kid_a1', password: CHILD_PW, firstName: 'Kit', lastName: 'Parent', dateOfBirth: '2016-05-01'
+    });
+    childId = created.body.user.id;
+    childToken = (await login('kid_a1', CHILD_PW)).body.token;
+  });
+
+  describe('deactivate / reactivate', () => {
+    it('blocks sign-in and kills existing sessions immediately', async () => {
+      expect((await me(childToken)).status).toBe(200);
+
+      const res = await setStatus(parentToken, childId, { isActive: false });
+      expect(res.status).toBe(200);
+      expect(res.body.user).toMatchObject({ id: childId, isActive: false });
+
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(401);
+      expect((await me(childToken)).status).toBe(401);
+      const list = await request(app).get('/api/auth/children').set(authz(parentToken));
+      expect(list.body.children[0].isActive).toBe(false);
+    });
+
+    it('reactivation restores sign-in but not tokens from before', async () => {
+      await setStatus(parentToken, childId, { isActive: false });
+      await setStatus(parentToken, childId, { isActive: true });
+
+      expect((await me(childToken)).status).toBe(401); // old token stays dead
+      const again = await login('kid_a1', CHILD_PW);
+      expect(again.status).toBe(200);
+      expect((await me(again.body.token)).status).toBe(200);
+    });
+
+    it('is limited to the parent\'s own children', async () => {
+      expect((await setStatus(otherToken, childId, { isActive: false })).status).toBe(404);
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(200); // untouched
+
+      expect((await setStatus(childToken, childId, { isActive: false })).status).toBe(403);
+      expect((await request(app).patch(`/api/auth/children/${childId}/status`).send({ isActive: false })).status).toBe(401);
+      expect((await setStatus(parentToken, mockUsers.rows.find((r) => r.role === 'parent')._id.toString(), { isActive: false })).status).toBe(404);
+      expect((await setStatus(parentToken, '5'.repeat(24), { isActive: false })).status).toBe(404);
+    });
+
+    it('validates the id and body', async () => {
+      expect((await setStatus(parentToken, 'zzz', { isActive: false })).status).toBe(400);
+      expect((await setStatus(parentToken, 'aaaaaaaaaaaa', { isActive: false })).status).toBe(400);
+      expect((await setStatus(parentToken, childId, { isActive: 'false' })).status).toBe(400);
+      expect((await setStatus(parentToken, childId, {})).status).toBe(400);
+    });
+  });
+
+  describe('reset password', () => {
+    it('sets the new password, rejects the old one, and signs the child out everywhere', async () => {
+      const NEW_PW = 'Brand9!NewPass';
+      const res = await resetPassword(parentToken, childId, NEW_PW);
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(NEW_PW);
+
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(401);
+      const fresh = await login('kid_a1', NEW_PW);
+      expect(fresh.status).toBe(200);
+      expect((await me(childToken)).status).toBe(401); // session from before the reset
+      expect((await me(fresh.body.token)).status).toBe(200);
+    });
+
+    it('unlocks a locked-out child', async () => {
+      for (let i = 0; i < 5; i++) await login('kid_a1', 'Wrong!Pass1');
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(429);
+
+      await resetPassword(parentToken, childId, 'Brand9!NewPass');
+      expect((await login('kid_a1', 'Brand9!NewPass')).status).toBe(200);
+    });
+
+    it('enforces the password rules without echoing the input', async () => {
+      const res = await resetPassword(parentToken, childId, 'weakpass');
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).not.toContain('weakpass');
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(200); // unchanged
+    });
+
+    it('is limited to the parent\'s own children', async () => {
+      expect((await resetPassword(otherToken, childId, 'Brand9!NewPass')).status).toBe(404);
+      expect((await resetPassword(childToken, childId, 'Brand9!NewPass')).status).toBe(403);
+      expect((await resetPassword(parentToken, 'nope', 'Brand9!NewPass')).status).toBe(400);
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(200); // untouched
+    });
+  });
+});
+
 describe('GET /api/auth/me', () => {
   it('returns the current user without secrets', async () => {
     const { token } = (await register()).body;

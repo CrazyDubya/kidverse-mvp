@@ -13,6 +13,7 @@ dotenv.config();
 
 const dashboardRoutes = require('./routes/dashboard');
 const authRoutes = require('./routes/auth');
+const User = require('./models/User');
 
 // Initialize Express app
 const app = express();
@@ -153,7 +154,7 @@ const escapeHtml = (str) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token || extractBearer(socket.handshake.headers.authorization);
   if (!token) {
     return next(new Error('Authentication required'));
@@ -164,7 +165,13 @@ io.use((socket, next) => {
     if (!decoded.userId) {
       return next(new Error('Invalid authentication token'));
     }
+    // A valid signature isn't enough: the account must still be active and the token current
+    const account = await User.findById(decoded.userId).select('isActive tokenVersion').lean();
+    if (!account || !account.isActive || (decoded.tv || 0) !== (account.tokenVersion || 0)) {
+      return next(new Error('Invalid authentication token'));
+    }
     socket.user = decoded;
+    socket.data.userId = String(decoded.userId); // lets the API find and drop this user's sockets
     next();
   } catch (error) {
     return next(new Error('Invalid authentication token'));

@@ -82,6 +82,7 @@ const makeCollection = ({ defaults = () => ({}), unique = [] } = {}) => {
       const row = match(filter)[0];
       if (!row) return { matchedCount: 0 };
       for (const [k, v] of Object.entries(norm(update.$set || {}))) setPath(row, k, v);
+      for (const [k, v] of Object.entries(update.$inc || {})) row[k] = (row[k] || 0) + v;
       for (const k of Object.keys(update.$unset || {})) delete row[k];
       return { matchedCount: 1 };
     },

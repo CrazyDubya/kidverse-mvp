@@ -8,7 +8,7 @@ import { api } from './api/client';
 
 vi.mock('./api/client', async (importOriginal) => ({
   ...(await importOriginal()),
-  api: { get: vi.fn(), post: vi.fn() }
+  api: { get: vi.fn(), post: vi.fn(), patch: vi.fn() }
 }));
 vi.mock('./api/socket', () => ({ connectSocket: () => ({ on: vi.fn(), off: vi.fn(), disconnect: vi.fn() }) }));
 
