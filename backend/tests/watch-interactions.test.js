@@ -267,7 +267,7 @@ describe('edge cases found in the second review', () => {
   it('gives up on a stalled server and retries instead of hanging', async () => {
     append('hello\n');
     const stalled = (url, init) =>
-      new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('timed out'))));
+      new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('timed out'))));
     const w = make({ fromStart: true, timeoutMs: 100 }, { fetchImpl: stalled });
     expect(await w.tick()).toMatchObject({ sent: 0, retry: true });
   });
@@ -276,7 +276,7 @@ describe('edge cases found in the second review', () => {
     append('hello\n');
     const controller = new AbortController();
     const stalled = (url, init) =>
-      new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+      new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
     const w = make({ fromStart: true, signal: controller.signal }, { fetchImpl: stalled });
     const pending = w.tick();
     setTimeout(() => controller.abort(), 50);
