@@ -332,4 +332,33 @@ describe('revocation is enforced everywhere', () => {
     expect((await patchStatus(kidA1._id, true)).status).toBe(200);
     expect(await within(gone, 2000)).toBe(true);
   });
+
+  it('drops a revoked socket on its own, even if the API never swept it', async () => {
+    // Simulates a failed/never-run sweep (adapter error, crash after the DB write): change the
+    // account directly and rely only on the socket's periodic self-check.
+    process.env.SOCKET_REVALIDATE_MS = '150';
+    try {
+      const revoked = await open(tokenFor(kidA1));
+      const bystander = await open(tokenFor(kidA2));
+      const gone = closed(revoked);
+
+      mockUsers.rows.find((r) => r.username === 'kid_a1').isActive = false;
+
+      expect(await within(gone, 3000)).toBe(true);
+      expect(bystander.connected).toBe(true);
+    } finally {
+      delete process.env.SOCKET_REVALIDATE_MS;
+    }
+  });
+
+  it('keeps connected clients connected across re-validation ticks', async () => {
+    process.env.SOCKET_REVALIDATE_MS = '100';
+    try {
+      const ok = await open(tokenFor(kidA1));
+      await settle(450);
+      expect(ok.connected).toBe(true);
+    } finally {
+      delete process.env.SOCKET_REVALIDATE_MS;
+    }
+  });
 });

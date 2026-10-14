@@ -204,6 +204,20 @@ io.on('connection', (socket) => {
       });
     });
 
+  // Safety net: the API's disconnect sweep is best-effort (adapter errors, a crash between the
+  // database write and the sweep), so each socket also re-validates itself periodically. This
+  // bounds how long a revoked session can linger. A transient database error keeps the
+  // socket and tries again next tick rather than dropping every client on a blip.
+  const revalidateMs = Number(process.env.SOCKET_REVALIDATE_MS) || 60 * 1000;
+  const revalidateTimer = setInterval(() => {
+    isSessionCurrent(user)
+      .then((ok) => {
+        if (!ok) socket.disconnect(true);
+      })
+      .catch((err) => console.error('Socket re-validation failed:', err.message));
+  }, revalidateMs);
+  revalidateTimer.unref();
+
   verified.then((ok) => {
     if (!ok || !socket.connected) return;
     activeUsers.set(socket.id, publicUser);
@@ -274,6 +288,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    clearInterval(revalidateTimer);
     const userData = activeUsers.get(socket.id);
     if (userData) {
       socket.to(scope).emit('user:offline', userData);
