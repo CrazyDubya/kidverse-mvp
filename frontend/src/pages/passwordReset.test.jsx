@@ -127,3 +127,20 @@ describe('reset link opened in an already-open tab', () => {
     expect(await screen.findByLabelText('New password')).toBeInTheDocument();
   });
 });
+
+describe('reset while already signed in', () => {
+  it('clears the stored session so the sign-in link works', async () => {
+    const user = userEvent.setup();
+    useAuth.setState({ token: 'someone-elses-jwt', user: { id: 'p2', role: 'parent', firstName: 'Other' } });
+    api.post.mockResolvedValue({ data: { success: true } });
+    renderAt(`/reset-password#token=${TOKEN}`);
+
+    await user.type(screen.getByLabelText('New password'), 'N3w!Passw0rd');
+    await user.type(screen.getByLabelText('Confirm new password'), 'N3w!Passw0rd');
+    await user.click(screen.getByRole('button', { name: 'Change password' }));
+    await user.click(await screen.findByRole('link', { name: 'Go to sign in' }));
+
+    expect(useAuth.getState().token).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Sign in to KidVerse' })).toBeInTheDocument();
+  });
+});

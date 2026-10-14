@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { api, errorMessage } from '../api/client';
+import { useAuth } from '../store/auth';
 import { AuthCard, Field, SubmitButton } from './AuthCard';
 
 // The emailed link is /reset-password#token=...; the fragment never reaches a server or log
@@ -9,6 +10,7 @@ const tokenFromHash = (hash) => new URLSearchParams(hash.replace(/^#/, '')).get(
 const ResetPassword = () => {
   const location = useLocation();
   const navigate = useNavigate();
+  const logout = useAuth((s) => s.logout);
   const [token, setToken] = useState(() => tokenFromHash(location.hash));
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -40,6 +42,9 @@ const ResetPassword = () => {
     setError(null);
     try {
       await api.post('/auth/reset-password', { token, password });
+      // The reset revokes the account's sessions; also drop whatever session this browser holds
+      // (possibly another account's), or "Go to sign in" would bounce straight to the dashboard
+      logout();
       setDone(true);
     } catch (err) {
       setError(errorMessage(err));
