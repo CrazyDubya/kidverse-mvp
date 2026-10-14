@@ -210,3 +210,50 @@ describe('login email normalisation', () => {
     expect((await login('Pat.Parent@gmail.com', PW)).status).toBe(200);
   });
 });
+
+describe('concurrency and sockets', () => {
+  it('sends one email, with the one valid token, when requests race', async () => {
+    await register();
+    await Promise.all([forgot('pat@example.com'), forgot('pat@example.com'), forgot('pat@example.com')]);
+    await settle();
+
+    expect(mailer.sendPasswordReset).toHaveBeenCalledTimes(1);
+    const token = mailer.sendPasswordReset.mock.calls[0][0].link.split('#token=')[1];
+    expect((await reset(token)).status).toBe(200);
+  });
+
+  it('drops a family-less admin\'s live socket after a reset', async () => {
+    const bcrypt = require('bcryptjs');
+    const jwt = require('jsonwebtoken');
+    const { io: connect } = require('socket.io-client');
+    const { server } = require('../server');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const socket = connect(`http://127.0.0.1:${server.address().port}`, {
+      reconnection: false,
+      forceNew: true,
+      auth: { token: '' }
+    });
+    try {
+      const admin = await mockUsers.create({
+        role: 'admin', email: 'root@example.com', firstName: 'Ad', lastName: 'Min',
+        passwordHash: bcrypt.hashSync(PW, 4), tokenVersion: 0
+      });
+      socket.auth = {
+        token: jwt.sign({ userId: String(admin._id), role: 'admin', username: 'Ad', tv: 0 }, process.env.JWT_SECRET, { algorithm: 'HS256' })
+      };
+      await new Promise((resolve, reject) => {
+        socket.on('connect', resolve);
+        socket.on('connect_error', reject);
+        socket.connect();
+      });
+
+      const gone = new Promise((resolve) => socket.on('disconnect', () => resolve(true)));
+      const token = await issueToken('root@example.com');
+      expect((await reset(token)).status).toBe(200);
+      expect(await Promise.race([gone, new Promise((r) => setTimeout(() => r(false), 2000))])).toBe(true);
+    } finally {
+      socket.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});

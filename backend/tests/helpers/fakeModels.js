@@ -2,12 +2,15 @@
 // run without a MongoDB server. Schema rules are covered separately in models.test.js.
 const mongoose = require('mongoose');
 
-// Equality plus the few operators the routes use ($gt, $ne)
+// Equality plus the few operators the routes use ($or, $gt, $lte, $ne, $exists)
 const matches = (doc, filter) =>
   Object.entries(filter).every(([k, v]) => {
+    if (k === '$or') return v.some((f) => matches(doc, f));
     if (v && typeof v === 'object' && !(v instanceof Date) && !v._bsontype) {
       if ('$gt' in v) return doc[k] != null && doc[k] > v.$gt;
+      if ('$lte' in v) return doc[k] != null && doc[k] <= v.$lte;
       if ('$ne' in v) return String(doc[k]) !== String(v.$ne);
+      if ('$exists' in v) return (doc[k] !== undefined) === v.$exists;
     }
     return String(doc[k]) === String(v);
   });

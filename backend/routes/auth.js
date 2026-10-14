@@ -158,7 +158,10 @@ const disconnectUser = async (req, user) => {
   const io = req.app.get('io');
   if (!io || !io.in) return;
   try {
-    for (const socket of await io.in(`family_${user.familyId}`).fetchSockets()) {
+    // Same scope the socket joined on connect: the family room, or a personal room for
+    // family-less accounts (admins)
+    const room = user.familyId ? `family_${user.familyId}` : `user_${user._id}`;
+    for (const socket of await io.in(room).fetchSockets()) {
       if (socket.data && socket.data.userId === String(user._id)) socket.disconnect(true);
     }
   } catch (err) {
@@ -274,18 +277,24 @@ router.post('/forgot-password', forgotLimiter, validateForgot, async (req, res) 
 
   try {
     const email = normalizeEmail(req.body.email.trim());
-    const user = await User.findOne({ email, isActive: true }).select('+passwordResetExpires');
+    const user = await User.findOne({ email, isActive: true }).lean();
     if (!user || user.role === 'child') return;
 
+    // Claim the cooldown and store the token in one conditional update. Concurrent requests
+    // can't both win, so only one email (carrying the one valid token) goes out.
     const now = Date.now();
-    const lastIssued = user.passwordResetExpires ? user.passwordResetExpires.getTime() - RESET_TTL_MS : 0;
-    if (now - lastIssued < RESET_COOLDOWN_MS) return;
-
     const token = crypto.randomBytes(32).toString('hex');
-    await User.updateOne(
-      { _id: user._id },
+    const claimed = await User.updateOne(
+      {
+        _id: user._id,
+        $or: [
+          { passwordResetExpires: { $exists: false } },
+          { passwordResetExpires: { $lte: new Date(now + RESET_TTL_MS - RESET_COOLDOWN_MS) } }
+        ]
+      },
       { $set: { passwordResetHash: sha256(token), passwordResetExpires: new Date(now + RESET_TTL_MS) } }
     );
+    if (!claimed.matchedCount) return;
 
     const base = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/+$/, '');
     await mailer.sendPasswordReset({

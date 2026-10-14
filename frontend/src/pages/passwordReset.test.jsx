@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { Link, MemoryRouter } from 'react-router-dom';
 import { AppRoutes } from '../App';
 import { useAuth } from '../store/auth';
 import { api } from '../api/client';
@@ -91,5 +91,39 @@ describe('reset password', () => {
     renderAt('/reset-password');
     expect(screen.getByRole('alert')).toHaveTextContent('invalid or has expired');
     expect(screen.queryByLabelText('New password')).not.toBeInTheDocument();
+  });
+});
+
+describe('reset link opened in an already-open tab', () => {
+  it('uses the newer token when only the fragment changes', async () => {
+    const user = userEvent.setup();
+    const NEWER = 'b'.repeat(64);
+    api.post.mockResolvedValue({ data: { success: true } });
+    render(
+      <MemoryRouter initialEntries={[`/reset-password#token=${TOKEN}`]}>
+        <Link to={`/reset-password#token=${NEWER}`}>newer link</Link>
+        <AppRoutes />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('link', { name: 'newer link' }));
+    await user.type(screen.getByLabelText('New password'), 'N3w!Passw0rd');
+    await user.type(screen.getByLabelText('Confirm new password'), 'N3w!Passw0rd');
+    await user.click(screen.getByRole('button', { name: 'Change password' }));
+
+    expect(api.post).toHaveBeenCalledWith('/auth/reset-password', { token: NEWER, password: 'N3w!Passw0rd' });
+  });
+
+  it('recovers from the invalid-link screen when a valid fragment arrives', async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={['/reset-password']}>
+        <Link to={`/reset-password#token=${TOKEN}`}>real link</Link>
+        <AppRoutes />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('invalid or has expired');
+    await user.click(screen.getByRole('link', { name: 'real link' }));
+    expect(await screen.findByLabelText('New password')).toBeInTheDocument();
   });
 });

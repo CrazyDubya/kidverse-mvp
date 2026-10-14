@@ -9,17 +9,26 @@ const tokenFromHash = (hash) => new URLSearchParams(hash.replace(/^#/, '')).get(
 const ResetPassword = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const [token] = useState(() => tokenFromHash(location.hash));
+  const [token, setToken] = useState(() => tokenFromHash(location.hash));
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [done, setDone] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  // Keep the token out of the address bar and browser history once it's in memory
+  // Take the token into memory and keep it out of the address bar and history. Runs on every
+  // hash change: opening a newer link in this same tab only changes the fragment, so the page
+  // isn't remounted and would otherwise keep submitting the old (expired or used) token.
   useEffect(() => {
-    if (location.hash) navigate({ pathname: location.pathname, hash: '' }, { replace: true });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!location.hash) return;
+    const fresh = tokenFromHash(location.hash);
+    if (fresh) {
+      setToken(fresh);
+      setDone(false);
+      setError(null);
+    }
+    navigate({ pathname: location.pathname, hash: '' }, { replace: true });
+  }, [location.hash]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit = async (e) => {
     e.preventDefault();
