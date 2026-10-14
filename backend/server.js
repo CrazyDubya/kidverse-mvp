@@ -14,6 +14,7 @@ dotenv.config();
 const dashboardRoutes = require('./routes/dashboard');
 const authRoutes = require('./routes/auth');
 const User = require('./models/User');
+const { authenticate } = require('./middleware/auth');
 
 // Initialize Express app
 const app = express();
@@ -109,27 +110,24 @@ const extractBearer = (header) => {
   return scheme === 'Bearer' && token ? token : null;
 };
 
-const authenticateToken = (req, res, next) => {
-  const token = extractBearer(req.headers.authorization);
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'Access token required' });
-  }
-
-  try {
-    req.user = verifyToken(token);
-    next();
-  } catch (error) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
-  }
+// A valid signature isn't enough: the account must still be active and the token's version
+// current (bumped on password reset and on deactivation/reactivation).
+const isSessionCurrent = async (claims) => {
+  const account = await User.findById(claims.userId).select('isActive tokenVersion').lean();
+  return Boolean(account && account.isActive && (claims.tv || 0) === (account.tokenVersion || 0));
 };
 
-// Optional authentication (doesn't fail if no token)
-const optionalAuth = (req, res, next) => {
+// Optional authentication (doesn't fail if there is no valid session)
+const optionalAuth = async (req, res, next) => {
+  req.user = null;
   const token = extractBearer(req.headers.authorization);
-  try {
-    req.user = token ? verifyToken(token) : null;
-  } catch (error) {
-    req.user = null;
+  if (token) {
+    try {
+      const claims = verifyToken(token);
+      if (claims.userId && (await isSessionCurrent(claims))) req.user = claims;
+    } catch (error) {
+      // invalid, expired or revoked: treated as anonymous
+    }
   }
   next();
 };
@@ -165,9 +163,7 @@ io.use(async (socket, next) => {
     if (!decoded.userId) {
       return next(new Error('Invalid authentication token'));
     }
-    // A valid signature isn't enough: the account must still be active and the token current
-    const account = await User.findById(decoded.userId).select('isActive tokenVersion').lean();
-    if (!account || !account.isActive || (decoded.tv || 0) !== (account.tokenVersion || 0)) {
+    if (!(await isSessionCurrent(decoded))) {
       return next(new Error('Invalid authentication token'));
     }
     socket.user = decoded;
@@ -187,6 +183,16 @@ io.on('connection', (socket) => {
   // Nothing is ever broadcast globally, so users can't see other families' traffic.
   const scope = user.familyId ? `family_${user.familyId}` : `user_${user.userId}`;
   socket.join(scope);
+
+  // Close the handshake/revocation race: access may have been revoked after the handshake read
+  // the account but before this socket was in its room, where the revoking request's
+  // disconnect scan could not see it. Re-check now that it is discoverable; any revocation
+  // after this read is guaranteed to find the socket.
+  isSessionCurrent(user)
+    .then((current) => {
+      if (!current) socket.disconnect(true);
+    })
+    .catch(() => socket.disconnect(true));
 
   activeUsers.set(socket.id, publicUser);
   socket.to(scope).emit('user:online', publicUser);
@@ -305,26 +311,26 @@ app.get('/api', (req, res) => {
 
 // Register API routes
 // app.use('/api/auth', authRoutes);
-// app.use('/api/users', authenticateToken, userRoutes);
-// app.use('/api/games', authenticateToken, gameRoutes);
+// app.use('/api/users', authenticate, userRoutes);
+// app.use('/api/games', authenticate, gameRoutes);
 // app.use('/api/content', optionalAuth, contentRoutes);
-// app.use('/api/parents', authenticateToken, parentRoutes);
+// app.use('/api/parents', authenticate, parentRoutes);
 
 // Placeholder routes (remove when actual routes are implemented)
 app.use('/api/auth', authRoutes);
 
-app.use('/api/users', authenticateToken, (req, res) => {
+app.use('/api/users', authenticate, (req, res) => {
   // SECURITY FIX: Don't expose full user object, only safe fields
   res.status(200).json({
     message: 'User routes - authenticated',
     user: {
-      id: req.user.userId,
+      id: String(req.user._id),
       role: req.user.role
     }
   });
 });
 
-app.use('/api/games', authenticateToken, (req, res) => {
+app.use('/api/games', authenticate, (req, res) => {
   res.status(200).json({ message: 'Game routes - to be implemented' });
 });
 
@@ -332,7 +338,7 @@ app.use('/api/content', optionalAuth, (req, res) => {
   res.status(200).json({ message: 'Content routes - to be implemented' });
 });
 
-app.use('/api/parents', authenticateToken, (req, res) => {
+app.use('/api/parents', authenticate, (req, res) => {
   res.status(200).json({ message: 'Parent routes - to be implemented' });
 });
 

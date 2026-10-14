@@ -203,3 +203,71 @@ describe('live sessions end when access is revoked', () => {
     expect(await open(tokenFor(kidA1))).toBeInstanceOf(Error);
   });
 });
+
+describe('revocation is enforced everywhere', () => {
+  const getWith = (path, token) =>
+    fetch(`${url}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  const patchStatus = (id, isActive) =>
+    fetch(`${url}/api/auth/children/${id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenFor(parentA)}` },
+      body: JSON.stringify({ isActive })
+    });
+
+  it('every authenticated API mount rejects a token after deactivation and after a reset', async () => {
+    const stale = tokenFor(kidA1);
+    for (const path of ['/api/users', '/api/games', '/api/parents', '/api/auth/me']) {
+      expect((await getWith(path, stale)).status).toBe(200); // sanity: works before revocation
+    }
+
+    expect((await patchStatus(kidA1._id, false)).status).toBe(200);
+    for (const path of ['/api/users', '/api/games', '/api/parents', '/api/auth/me']) {
+      expect((await getWith(path, stale)).status).toBe(401);
+    }
+
+    // reactivation does not resurrect it either
+    await patchStatus(kidA1._id, true);
+    for (const path of ['/api/users', '/api/games', '/api/parents', '/api/auth/me']) {
+      expect((await getWith(path, stale)).status).toBe(401);
+    }
+    expect((await getWith('/api/users', tokenFor({ ...kidA1, tokenVersion: 2 }))).status).toBe(200);
+  });
+
+  it('optional-auth routes treat a revoked token as anonymous (and still serve public content)', async () => {
+    await patchStatus(kidA1._id, false);
+    expect((await getWith('/api/content', tokenFor(kidA1))).status).toBe(200);
+  });
+
+  it('does not leave a socket connected when access is revoked during its handshake', async () => {
+    // Reproduce the race: the handshake reads the account (still active), then the parent
+    // deactivates the child before the connection is registered. The revoking request's
+    // disconnect scan can't see a socket that hasn't joined its room yet.
+    const realFindById = mockUsers.findById;
+    let armed = true;
+    mockUsers.findById = (id) => {
+      const real = realFindById(id);
+      if (!armed) return real;
+      armed = false;
+      const staleThenRevoke = {
+        select: () => staleThenRevoke,
+        lean: () => staleThenRevoke,
+        then: (resolve, reject) =>
+          real
+            .then(async (snapshotBeforeRevocation) => {
+              expect((await patchStatus(kidA1._id, false)).status).toBe(200);
+              return snapshotBeforeRevocation;
+            })
+            .then(resolve, reject)
+      };
+      return staleThenRevoke;
+    };
+
+    try {
+      const s = await open(tokenFor(kidA1)); // admitted using the stale pre-revocation snapshot
+      expect(s).not.toBeInstanceOf(Error);
+      expect(await within(closed(s), 2000)).toBe(true); // ...but must not stay connected
+    } finally {
+      mockUsers.findById = realFindById;
+    }
+  });
+});
