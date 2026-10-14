@@ -105,6 +105,11 @@ Parents who forget their password use "Forgot your password?" on the sign-in pag
   KIDVERSE_PASSWORD=... node scripts/send-interaction.js --user kid_username --file chat.txt
   ```
   Risky messages raise an alert on the dashboard immediately. Use `--help` for all options; as a parent, pass `--child-id`.
+- To feed it continuously, run the watcher against a log file that something keeps appending to (plain or JSON lines, as above):
+  ```bash
+  KIDVERSE_PASSWORD=... node scripts/watch-interactions.js --user kid_username --file ~/roblox-chat.jsonl
+  ```
+  It follows the file like `tail -f`, remembers its position (restarts don't resend), waits for half-written lines, and retries with backoff when the server is down. Rotation by renaming or deleting the log (logrotate's default) is safe even during an outage: it finishes the old file first. **Avoid `copytruncate`**: truncating in place destroys lines the watcher hasn't delivered yet (it warns when it sees this). Known limit: if the server is down, the log is rotated, and the watcher is restarted before it recovers, lines from the old file that were never delivered cannot be recovered (the watcher warns at startup when it sees this). A corrupt progress file stops the watcher rather than guessing where to resume. Roblox itself offers no feed of a player's chat, so you need a source that writes the file (an in-game script relaying chat, a proxy, or an exporter you already have); the watcher deliberately does not scrape Roblox accounts or ask for the child's Roblox cookie.
 - Tests: `npm test` in `backend/` and `frontend/`; `npm run lint` in each
 
 ### Contributing
