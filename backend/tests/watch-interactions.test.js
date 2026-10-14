@@ -373,6 +373,36 @@ describe('untrustworthy progress files and in-place truncation', () => {
     expect(mockInteractions.rows).toHaveLength(0);
   });
 
+  it.each([
+    ['missing ino', { offset: 3, head: '616161' }],
+    ['non-numeric ino', { offset: 3, ino: 'x', head: '616161' }],
+    ['missing head', { offset: 3, ino: 1 }],
+    ['head of the wrong length', { offset: 3, ino: 1, head: '61' }],
+    ['non-hex head', { offset: 3, ino: 1, head: 'zzzzzz' }],
+    ['non-boolean skipping', { offset: 3, ino: 1, head: '616161', skipping: 'yes' }]
+  ])('rejects a checkpoint with %s', (_, state) => {
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    expect(() => make()).toThrow(/corrupt/);
+  });
+
+  it('accepts a checkpoint the watcher wrote itself', async () => {
+    append('one\ntwo\n');
+    const w = make({ fromStart: true });
+    await w.tick();
+    w.close();
+    expect(() => make()).not.toThrow();
+  });
+
+  it('warns when the log is rewritten in place and regrows past the old offset', async () => {
+    append('aaaaaaaaaa\n');
+    const w = make({ fromStart: true });
+    await w.tick();
+    fs.writeFileSync(file, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'); // same inode, longer than before
+    expect((await w.tick()).sent).toBe(1);
+    expect(errs.join('\n')).toMatch(/rewritten in place/);
+    w.close();
+  });
+
   it('a missing progress file is just a first run', () => {
     expect(() => make()).not.toThrow();
   });
@@ -384,7 +414,7 @@ describe('untrustworthy progress files and in-place truncation', () => {
     fs.truncateSync(file, 0);
     append('after\n');
     expect((await w.tick()).sent).toBe(1);
-    expect(errs.join('\n')).toMatch(/truncated in place/);
+    expect(errs.join('\n')).toMatch(/truncated or rewritten in place/);
     w.close();
   });
 });

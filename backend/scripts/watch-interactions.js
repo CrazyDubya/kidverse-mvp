@@ -78,7 +78,15 @@ const loadState = (path) => {
   } catch {
     s = null;
   }
-  if (!s || !Number.isInteger(s.offset) || s.offset < 0) {
+  // Every field is checked: a wrong `skipping` would swallow a line, a wrong `ino`/`head` would
+  // resend the whole log
+  const valid =
+    s &&
+    Number.isInteger(s.offset) && s.offset >= 0 &&
+    Number.isInteger(s.ino) && s.ino >= 0 &&
+    typeof s.head === 'string' && /^[0-9a-f]*$/.test(s.head) && s.head.length === 2 * Math.min(s.offset, HEAD_BYTES) &&
+    (s.skipping === undefined || typeof s.skipping === 'boolean');
+  if (!valid) {
     throw new Error(`The progress file ${path} is corrupt. Fix or delete it (deleting skips what is already in the log).`);
   }
   return s;
@@ -225,7 +233,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     if (size < state.offset || readHead(handle.fd, state.offset) !== (state.head || '')) {
       // Truncated or rewritten in place: the old bytes are gone, so anything not yet delivered
       // from them is lost (rename-style rotation avoids this; see the README)
-      if (size < state.offset) err('The log was truncated in place; messages not yet delivered from it may be lost.');
+      err('The log was truncated or rewritten in place; messages not yet delivered from it may be lost.');
       state = { offset: 0, ino: handle.ino };
     }
     if (size === state.offset) return;
