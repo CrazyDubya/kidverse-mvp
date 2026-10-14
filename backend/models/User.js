@@ -25,7 +25,10 @@ const userSchema = new mongoose.Schema(
     // Bumped on password reset and (de)activation; tokens carry it, so older ones stop working
     tokenVersion: { type: Number, default: 0 },
     failedLoginAttempts: { type: Number, default: 0, select: false },
-    lockUntil: { type: Date, select: false }
+    lockUntil: { type: Date, select: false },
+    // Emailed password-reset token: only its SHA-256 is stored, so a database leak can't be replayed
+    passwordResetHash: { type: String, select: false, index: true, sparse: true },
+    passwordResetExpires: { type: Date, select: false }
   },
   {
     timestamps: true,
@@ -34,6 +37,8 @@ const userSchema = new mongoose.Schema(
         delete ret.passwordHash;
         delete ret.failedLoginAttempts;
         delete ret.lockUntil;
+        delete ret.passwordResetHash;
+        delete ret.passwordResetExpires;
         delete ret.__v;
         return ret;
       }
