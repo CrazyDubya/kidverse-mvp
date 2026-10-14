@@ -28,11 +28,14 @@ const authLimiter = rateLimit({
 
 // ---------- validators ----------
 
-// bcrypt ignores everything past 72 bytes, so cap it
+// bcrypt silently ignores everything past 72 *bytes* (not characters), so a longer password
+// would be truncated and a different one sharing its first 72 bytes would also log in
 const passwordRule = body('password')
   .isString()
   .isLength({ min: 8, max: 72 })
   .withMessage('Password must be 8-72 characters')
+  .custom((value) => Buffer.byteLength(value, 'utf8') <= 72)
+  .withMessage('Password is too long (72 bytes maximum; symbols and emoji count for more than one)')
   .matches(/[a-z]/)
   .withMessage('Password must contain a lowercase letter')
   .matches(/[A-Z]/)

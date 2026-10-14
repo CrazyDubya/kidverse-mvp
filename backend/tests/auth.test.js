@@ -56,6 +56,15 @@ describe('POST /api/auth/register', () => {
     expect(res.status).toBe(400);
   });
 
+  it('counts bcrypt\'s 72-byte limit in bytes, not characters', async () => {
+    const multibyte = 'Aa1!' + '€'.repeat(30); // 34 characters, 94 bytes
+    expect(multibyte.length).toBeLessThanOrEqual(72);
+    expect((await register({ ...parent, password: multibyte })).status).toBe(400);
+
+    const exactly72 = 'Aa1!' + 'x'.repeat(68); // 72 bytes: still allowed
+    expect((await register({ ...parent, password: exactly72 })).status).toBe(201);
+  });
+
   it('rejects non-string fields (operator injection)', async () => {
     const res = await register({ ...parent, email: { $gt: '' } });
     expect(res.status).toBe(400);
@@ -280,6 +289,12 @@ describe('managing children', () => {
 
       await resetPassword(parentToken, childId, 'Brand9!NewPass');
       expect((await login('kid_a1', 'Brand9!NewPass')).status).toBe(200);
+    });
+
+    it('applies the byte limit to resets too', async () => {
+      const res = await resetPassword(parentToken, childId, 'Aa1!' + '€'.repeat(30));
+      expect(res.status).toBe(400);
+      expect((await login('kid_a1', CHILD_PW)).status).toBe(200); // unchanged
     });
 
     it('enforces the password rules without echoing the input', async () => {
