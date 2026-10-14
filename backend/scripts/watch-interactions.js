@@ -171,7 +171,8 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
     });
 
-  // Returns true when signed in; 'fatal' for bad credentials (retrying only locks the account)
+  // Returns true when signed in; 'fatal' for credentials/config the server will never accept
+  // (retrying only locks the account or burns the rate limit)
   const login = async () => {
     let res;
     try {
@@ -186,7 +187,8 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       return true;
     }
     err(`Login failed (${res.status}): ${body.message || 'unknown error'}`);
-    return res.status === 401 || res.status === 403 ? 'fatal' : false;
+    // Rate limiting (429) and server trouble (5xx) pass; any other 4xx is a configuration error
+    return res.status >= 400 && res.status < 500 && res.status !== 429 ? 'fatal' : false;
   };
 
   // 'sent' | 'skipped' (will never succeed) | 'retry' | 'fatal'

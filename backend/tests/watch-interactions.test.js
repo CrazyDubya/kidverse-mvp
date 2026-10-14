@@ -172,6 +172,16 @@ describe('delivery failures', () => {
   });
 });
 
+describe('login rejections', () => {
+  it('treats a malformed login (400) as fatal, but a rate limit (429) or outage (503) as retryable', async () => {
+    append('hello\n');
+    expect(await make({ fromStart: true, identifier: 'ab' }).tick()).toMatchObject({ retry: true, fatal: true });
+    const answer = (status) => () => Promise.resolve({ ok: false, status, json: async () => ({ message: 'x' }) });
+    expect(await make({ fromStart: true }, { fetchImpl: answer(429) }).tick()).toMatchObject({ retry: true, fatal: false });
+    expect(await make({ fromStart: true }, { fetchImpl: answer(503) }).tick()).toMatchObject({ retry: true, fatal: false });
+  });
+});
+
 describe('command line', () => {
   it('validates arguments', async () => {
     const out = [];
