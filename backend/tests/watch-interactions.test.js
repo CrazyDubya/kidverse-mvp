@@ -299,3 +299,62 @@ describe('edge cases found in the second review', () => {
     expect((await w.tick()).sent).toBe(1); // and it carries on afterwards
   });
 });
+
+describe('rotation during an outage and checkpoint failures', () => {
+  const outage = () => {
+    let up = false;
+    return {
+      fetchImpl: (url, init) =>
+        up || String(url).endsWith('/auth/login')
+          ? fetch(url, init)
+          : Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+      recover: () => { up = true; }
+    };
+  };
+
+  it('delivers the old file\'s undelivered lines after it was rotated away, then the new file', async () => {
+    const o = outage();
+    append('a\nb\n');
+    const w = make({ fromStart: true }, { fetchImpl: o.fetchImpl });
+    expect((await w.tick()).retry).toBe(true);
+
+    fs.renameSync(file, `${file}.1`); // logrotate
+    append('c\n');
+    o.recover();
+    const r = await w.tick();
+    expect(r).toMatchObject({ sent: 3, retry: false });
+    expect(mockInteractions.rows.map((x) => x.message)).toEqual(['a', 'b', 'c']);
+    expect((await w.tick()).sent).toBe(0);
+    w.close();
+  });
+
+  it('also drains a file that was deleted outright', async () => {
+    const o = outage();
+    append('a\nb\n');
+    const w = make({ fromStart: true }, { fetchImpl: o.fetchImpl });
+    await w.tick();
+    fs.rmSync(file);
+    o.recover();
+    expect((await w.tick()).sent).toBe(2);
+    append('c\n'); // a new file appears later: all of it is new
+    expect((await w.tick()).sent).toBe(1);
+    w.close();
+  });
+
+  it('does not treat an unwritable progress file as a missing log', async () => {
+    append('a\n');
+    const w = make({ fromStart: true, statePath: path.join(dir, 'no-such-dir', 'state') });
+    await expect(w.tick()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('stops with exit code 1 and a clear message when it cannot checkpoint', async () => {
+    append('a\n');
+    const messages = [];
+    const code = await run(
+      ['--api', api, '--user', 'kidc', '--file', file, '--from-start', '--state', path.join(dir, 'no-such-dir', 'state'), '--poll-ms', '50'],
+      { env: { KIDVERSE_PASSWORD: PW }, log: () => {}, err: (m) => messages.push(m), sleep: async () => {} }
+    );
+    expect(code).toBe(1);
+    expect(messages.join('\n')).toMatch(/Stopping: .*ENOENT/);
+  });
+});

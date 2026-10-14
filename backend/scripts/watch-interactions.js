@@ -74,32 +74,22 @@ const loadState = (path) => {
 // The bytes already consumed (first 64 at most). An append-only log never changes them, so a
 // mismatch means the file was replaced, even if it kept its inode and grew past our offset.
 const HEAD_BYTES = 64;
-const readHead = (file, offset) => {
+const readHead = (fd, offset) => {
   const length = Math.min(offset, HEAD_BYTES);
   if (length === 0) return '';
   const buf = Buffer.alloc(length);
-  const fd = fs.openSync(file, 'r');
-  try {
-    const n = fs.readSync(fd, buf, 0, length, 0);
-    return buf.toString('hex', 0, n);
-  } finally {
-    fs.closeSync(fd);
-  }
+  const n = fs.readSync(fd, buf, 0, length, 0);
+  return buf.toString('hex', 0, n);
 };
 
 // Offset just past the last newline, so a line still being written at startup is delivered whole
 // once finished instead of as a fragment. With no newline in view, a small file is one line in
 // progress (start at 0); a huge one is junk: start at the end and drop it through its newline.
-const startPosition = (file, size) => {
+const startPosition = (fd, size) => {
   const length = Math.min(size, MAX_LINE);
   if (length === 0) return { offset: 0 };
   const buf = Buffer.alloc(length);
-  const fd = fs.openSync(file, 'r');
-  try {
-    fs.readSync(fd, buf, 0, length, size - length);
-  } finally {
-    fs.closeSync(fd);
-  }
+  fs.readSync(fd, buf, 0, length, size - length);
   const nl = buf.lastIndexOf(0x0a);
   if (nl !== -1) return { offset: size - length + nl + 1 };
   return size <= MAX_LINE ? { offset: 0 } : { offset: size, skipping: true };
@@ -121,8 +111,33 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
   let state = loadState(statePath); // { offset, ino, head }
   let seenMissing = false;
 
+  // The file being read stays open. After a rotation the old file is still readable through this
+  // descriptor, so lines that couldn't be delivered yet (server outage) aren't lost with it.
+  let handle = null; // { fd, ino }
+  const closeHandle = () => {
+    if (!handle) return;
+    try {
+      fs.closeSync(handle.fd);
+    } catch {
+      // already gone
+    }
+    handle = null;
+  };
+  // Only a missing *log* is benign; any other error (including a failing checkpoint) must surface
+  const openHandle = () => {
+    try {
+      const fd = fs.openSync(file, 'r');
+      handle = { fd, ino: fs.fstatSync(fd).ino };
+      return true;
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      seenMissing = true;
+      return false;
+    }
+  };
+
   const persist = () => {
-    state.head = readHead(file, state.offset);
+    state.head = readHead(handle.fd, state.offset);
     saveState(statePath, state);
   };
 
@@ -191,35 +206,17 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     return 'retry';
   };
 
-  const tickOnce = async () => {
-    const result = { sent: 0, skipped: 0, retry: false, fatal: false };
-    let stat;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      seenMissing = true;
-      return result; // not created yet
+  // Delivers one chunk of whatever is available in the open file
+  const consume = async (result) => {
+    const size = fs.fstatSync(handle.fd).size;
+    if (size < state.offset || readHead(handle.fd, state.offset) !== (state.head || '')) {
+      state = { offset: 0, ino: handle.ino }; // truncated or rewritten in place
     }
+    if (size === state.offset) return;
 
-    if (!state) {
-      // First run: by default ignore history so old messages aren't replayed as new, unless the
-      // file only appeared after we started watching, in which case all of it is new
-      state = { ...(fromStart || seenMissing ? { offset: 0 } : startPosition(file, stat.size)), ino: stat.ino };
-      persist();
-    }
-    if (stat.ino !== state.ino || stat.size < state.offset || readHead(file, state.offset) !== (state.head || '')) {
-      state = { offset: 0, ino: stat.ino }; // rotated, truncated or replaced
-    }
-    if (stat.size === state.offset) return result;
-
-    const length = Math.min(stat.size - state.offset, MAX_CHUNK);
+    const length = Math.min(size - state.offset, MAX_CHUNK);
     const buf = Buffer.alloc(length);
-    const fd = fs.openSync(file, 'r');
-    try {
-      fs.readSync(fd, buf, 0, length, state.offset);
-    } finally {
-      fs.closeSync(fd);
-    }
+    fs.readSync(handle.fd, buf, 0, length, state.offset);
 
     let pos = 0;
     if (state.skipping) {
@@ -265,7 +262,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       if (outcome === 'retry' || outcome === 'fatal') {
         result.retry = true;
         result.fatal = outcome === 'fatal';
-        return result; // offset not advanced: this line is sent again next time
+        return; // offset not advanced: this line is sent again next time
       }
       if (outcome === 'sent') result.sent++;
       if (outcome === 'skipped') result.skipped++;
@@ -273,21 +270,46 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
       persist();
       pos = next;
     }
-    return result;
   };
 
-  // The producer may rotate or delete the file between any two of our reads: treat as "missing"
   const tick = async () => {
+    const result = { sent: 0, skipped: 0, retry: false, fatal: false };
+    let stat = null;
     try {
-      return await tickOnce();
+      stat = fs.statSync(file);
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
       seenMissing = true;
-      return { sent: 0, skipped: 0, retry: false, fatal: false };
     }
+
+    if (handle && (!stat || stat.ino !== handle.ino)) {
+      // Rotated or deleted: finish the old file first (like tail -F), then move on. An
+      // unterminated tail can never complete, so it is dropped with the file.
+      for (;;) {
+        const before = state.offset;
+        await consume(result);
+        if (result.retry) return result;
+        if (state.offset === before) break;
+      }
+      closeHandle();
+    }
+    if (!handle && (!stat || !openHandle())) return result;
+
+    if (!state) {
+      // First run: by default ignore history so old messages aren't replayed as new, unless the
+      // file only appeared after we started watching, in which case all of it is new
+      const size = fs.fstatSync(handle.fd).size;
+      state = { ...(fromStart || seenMissing ? { offset: 0 } : startPosition(handle.fd, size)), ino: handle.ino };
+      persist();
+    } else if (state.ino !== handle.ino) {
+      state = { offset: 0, ino: handle.ino }; // a different file than the one we checkpointed
+    }
+
+    await consume(result);
+    return result;
   };
 
-  return { tick, log };
+  return { tick, close: closeHandle, log };
 }
 
 // Resolves early when the signal aborts, so shutdown isn't held up by a long backoff
@@ -363,15 +385,23 @@ async function run(argv, { env = process.env, fetchImpl = fetch, log = console.l
 
   log(`Watching ${args.file} -> ${api}`);
   let backoff = pollMs;
-  while (!(signal && signal.aborted)) {
-    const r = await watcher.tick();
-    if (r.sent) log(`sent ${r.sent} message${r.sent === 1 ? '' : 's'}`);
-    if (r.fatal) {
-      err('Stopping: the server refused these credentials.');
-      return 1;
+  try {
+    while (!(signal && signal.aborted)) {
+      const r = await watcher.tick();
+      if (r.sent) log(`sent ${r.sent} message${r.sent === 1 ? '' : 's'}`);
+      if (r.fatal) {
+        err('Stopping: the server refused these credentials.');
+        return 1;
+      }
+      backoff = r.retry ? Math.min(backoff * 2, MAX_BACKOFF_MS) : pollMs;
+      await sleep(backoff, signal);
     }
-    backoff = r.retry ? Math.min(backoff * 2, MAX_BACKOFF_MS) : pollMs;
-    await sleep(backoff, signal);
+  } catch (e) {
+    // e.g. the progress file can't be written: carrying on would risk resending or losing lines
+    err(`Stopping: ${e.message}`);
+    return 1;
+  } finally {
+    watcher.close();
   }
   return 0;
 }
