@@ -86,6 +86,24 @@ const readHead = (file, offset) => {
   }
 };
 
+// Offset just past the last newline, so a line still being written at startup is delivered whole
+// once finished instead of as a fragment. With no newline in view, a small file is one line in
+// progress (start at 0); a huge one is junk (start at the end).
+const startOffset = (file, size) => {
+  const length = Math.min(size, MAX_LINE);
+  if (length === 0) return 0;
+  const buf = Buffer.alloc(length);
+  const fd = fs.openSync(file, 'r');
+  try {
+    fs.readSync(fd, buf, 0, length, size - length);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const nl = buf.lastIndexOf(0x0a);
+  if (nl !== -1) return size - length + nl + 1;
+  return size <= MAX_LINE ? 0 : size;
+};
+
 const saveState = (path, state) => {
   const tmp = `${path}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(state));
@@ -183,7 +201,7 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     if (!state) {
       // First run: by default ignore history so old messages aren't replayed as new, unless the
       // file only appeared after we started watching, in which case all of it is new
-      state = { offset: fromStart || seenMissing ? 0 : stat.size, ino: stat.ino };
+      state = { offset: fromStart || seenMissing ? 0 : startOffset(file, stat.size), ino: stat.ino };
       persist();
     }
     if (stat.ino !== state.ino || stat.size < state.offset || readHead(file, state.offset) !== (state.head || '')) {
@@ -201,13 +219,23 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
     }
 
     let pos = 0;
+    if (state.skipping) {
+      // Inside an oversized line: drop everything up to and including its newline
+      const nl = buf.indexOf(0x0a);
+      const consumed = nl === -1 ? buf.length : nl + 1;
+      state.offset += consumed;
+      if (nl !== -1) state.skipping = false;
+      persist();
+      pos = consumed;
+    }
     while (pos < buf.length) {
       const nl = buf.indexOf(0x0a, pos);
       if (nl === -1) {
-        // No newline in the whole chunk and it is huge: it can't be a message, skip it
-        if (buf.length >= MAX_LINE && pos === 0 && length === MAX_CHUNK) {
+        if (buf.length - pos >= MAX_LINE) {
+          // Already too long to be a message and still no end: drop it, and the rest of it too
           err('Skipping an oversized line');
-          state.offset += buf.length;
+          state.offset += buf.length - pos;
+          state.skipping = true;
           result.skipped++;
           persist();
         }
@@ -248,7 +276,20 @@ function createWatcher(opts, { fetchImpl = fetch, log = console.log, err = conso
   return { tick, log };
 }
 
-async function run(argv, { env = process.env, fetchImpl = fetch, log = console.log, err = console.error, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), signal } = {}) {
+// Resolves early when the signal aborts, so shutdown isn't held up by a long backoff
+const defaultSleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal && signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    if (signal) signal.addEventListener('abort', done);
+  });
+
+async function run(argv, { env = process.env, fetchImpl = fetch, log = console.log, err = console.error, sleep = defaultSleep, signal } = {}) {
   let args;
   try {
     args = parseArgs(argv);
@@ -315,7 +356,7 @@ async function run(argv, { env = process.env, fetchImpl = fetch, log = console.l
       return 1;
     }
     backoff = r.retry ? Math.min(backoff * 2, MAX_BACKOFF_MS) : pollMs;
-    await sleep(backoff);
+    await sleep(backoff, signal);
   }
   return 0;
 }

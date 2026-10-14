@@ -210,3 +210,46 @@ describe('command line', () => {
     expect(code).toBe(1);
   });
 });
+
+describe('edge cases found in review', () => {
+  it('delivers a line that was half-written when the watcher started, whole', async () => {
+    append('already seen\nsecret: meet me at');
+    const w = make();
+    expect((await w.tick()).sent).toBe(0);
+    append(' the park\n');
+    expect((await w.tick()).sent).toBe(1);
+    expect(mockInteractions.rows.map((r) => r.message)).toEqual(['secret: meet me at the park']);
+  });
+
+  it('drops an oversized line through its newline, never sending its tail as a message', async () => {
+    const w = make({ fromStart: true });
+    append('before\n');
+    append('y'.repeat(70 * 1024)); // no newline yet: already too long
+    expect((await w.tick()).sent).toBe(1);
+    append('tail of the long line\nafter\n');
+    const r = await w.tick();
+    expect(r.sent).toBe(1);
+    expect(mockInteractions.rows.map((x) => x.message)).toEqual(['before', 'after']);
+  });
+
+  it('drops a multi-megabyte line the same way', async () => {
+    append(`${'z'.repeat(2.5 * 1024 * 1024)}\nok\n`);
+    const w = make({ fromStart: true });
+    let sent = 0;
+    for (let i = 0; i < 5; i++) sent += (await w.tick()).sent;
+    expect(sent).toBe(1);
+    expect(mockInteractions.rows.map((x) => x.message)).toEqual(['ok']);
+  });
+
+  it('shuts down promptly even in the middle of a long backoff', async () => {
+    const controller = new AbortController();
+    append('x\n');
+    const started = Date.now();
+    const done = run(['--api', 'http://127.0.0.1:1', '--user', 'kidc', '--file', file, '--from-start', '--poll-ms', '60000'], {
+      env: { KIDVERSE_PASSWORD: PW }, log: () => {}, err: () => {}, signal: controller.signal
+    });
+    setTimeout(() => controller.abort(), 200);
+    expect(await done).toBe(0);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});
