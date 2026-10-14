@@ -2,19 +2,24 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const validator = require('validator');
 const { body } = require('express-validator');
 
 const User = require('../models/User');
 const Family = require('../models/Family');
 const { authenticate, requireParent } = require('../middleware/auth');
 const { handleValidationErrors } = require('../middleware/validation');
+const mailer = require('../services/mailer');
 
 const router = express.Router();
 
 const BCRYPT_ROUNDS = 12;
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_MS = 15 * 60 * 1000;
+const RESET_TTL_MS = 60 * 60 * 1000;
+const RESET_COOLDOWN_MS = 60 * 1000; // at most one reset email per account per minute
 // Compared against when the account doesn't exist so response time doesn't reveal it
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', BCRYPT_ROUNDS);
 
@@ -24,6 +29,15 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many authentication attempts. Please try again later.' }
+});
+
+// Per-IP cap on reset requests; the per-account cooldown below stops one victim being mail-bombed
+const forgotLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: parseInt(process.env.FORGOT_RATE_LIMIT_MAX, 10) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests. Please try again later.' }
 });
 
 // ---------- validators ----------
@@ -58,6 +72,20 @@ const validateRegister = [
   passwordRule,
   nameRule('firstName'),
   nameRule('lastName'),
+  handleValidationErrors
+];
+
+// Must match how register stores emails (e.g. Gmail dots are dropped), or users couldn't sign in
+const normalizeEmail = (email) => validator.normalizeEmail(email) || email.toLowerCase();
+
+const validateForgot = [
+  body('email').isString().trim().isLength({ min: 3, max: 254 }).withMessage('A valid email is required'),
+  handleValidationErrors
+];
+
+const validateReset = [
+  body('token').isString().matches(/^[a-f0-9]{64}$/).withMessage('This reset link is invalid or has expired'),
+  passwordRule,
   handleValidationErrors
 ];
 
@@ -130,7 +158,10 @@ const disconnectUser = async (req, user) => {
   const io = req.app.get('io');
   if (!io || !io.in) return;
   try {
-    for (const socket of await io.in(`family_${user.familyId}`).fetchSockets()) {
+    // Same scope the socket joined on connect: the family room, or a personal room for
+    // family-less accounts (admins)
+    const room = user.familyId ? `family_${user.familyId}` : `user_${user._id}`;
+    for (const socket of await io.in(room).fetchSockets()) {
       if (socket.data && socket.data.userId === String(user._id)) socket.disconnect(true);
     }
   } catch (err) {
@@ -193,7 +224,7 @@ router.post('/login', authLimiter, validateLogin, async (req, res, next) => {
   try {
     const identifier = req.body.identifier.trim().toLowerCase();
     const { password } = req.body;
-    const query = identifier.includes('@') ? { email: identifier } : { username: identifier };
+    const query = identifier.includes('@') ? { email: normalizeEmail(identifier) } : { username: identifier };
 
     const user = await User.findOne(query).select('+passwordHash +failedLoginAttempts +lockUntil');
 
@@ -226,6 +257,87 @@ router.post('/login', authLimiter, validateLogin, async (req, res, next) => {
     }
 
     res.json({ success: true, token: signToken(user), user: publicUser(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const background = (label, promise) => promise.catch((err) => console.error(`${label} failed:`, err.message));
+
+/**
+ * POST /api/auth/forgot-password
+ * { email }. Always answers the same way, so it can't be used to discover which emails are
+ * registered; the work (and any email) happens after the response is sent. The link points at
+ * CLIENT_URL, never the Host header, and carries the token in the #fragment so it isn't sent
+ * to servers, logs or Referer headers. Only parent/admin accounts have emails.
+ */
+router.post('/forgot-password', forgotLimiter, validateForgot, async (req, res) => {
+  res.json({ success: true, message: 'If that email belongs to an account, a reset link is on its way.' });
+
+  try {
+    const email = normalizeEmail(req.body.email.trim());
+    const user = await User.findOne({ email, isActive: true }).lean();
+    if (!user || user.role === 'child') return;
+
+    // Claim the cooldown and store the token in one conditional update. Concurrent requests
+    // can't both win, so only one email (carrying the one valid token) goes out.
+    const now = Date.now();
+    const token = crypto.randomBytes(32).toString('hex');
+    const claimed = await User.updateOne(
+      {
+        _id: user._id,
+        $or: [
+          { passwordResetExpires: { $exists: false } },
+          { passwordResetExpires: { $lte: new Date(now + RESET_TTL_MS - RESET_COOLDOWN_MS) } }
+        ]
+      },
+      { $set: { passwordResetHash: sha256(token), passwordResetExpires: new Date(now + RESET_TTL_MS) } }
+    );
+    if (!claimed.matchedCount) return;
+
+    const base = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    await mailer.sendPasswordReset({
+      to: user.email,
+      firstName: user.firstName,
+      link: `${base}/reset-password#token=${token}`,
+      ttlMinutes: RESET_TTL_MS / 60000
+    });
+  } catch (err) {
+    console.error('forgot-password failed:', err.message);
+  }
+});
+
+/**
+ * POST /api/auth/reset-password
+ * { token, password }. The token is single-use: it's matched and consumed in one atomic
+ * update, so two concurrent requests can't both succeed. Success also unlocks the account,
+ * revokes every existing session and disconnects live sockets.
+ */
+router.post('/reset-password', authLimiter, validateReset, async (req, res, next) => {
+  try {
+    const passwordHash = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+    const user = await User.findOneAndUpdate(
+      {
+        passwordResetHash: sha256(req.body.token),
+        passwordResetExpires: { $gt: new Date() },
+        isActive: true,
+        role: { $ne: 'child' }
+      },
+      {
+        $set: { passwordHash, failedLoginAttempts: 0 },
+        $unset: { lockUntil: 1, passwordResetHash: 1, passwordResetExpires: 1 },
+        $inc: { tokenVersion: 1 }
+      }
+    ).lean();
+
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'This reset link is invalid or has expired' });
+    }
+
+    await disconnectUser(req, user);
+    background('password-changed email', mailer.sendPasswordChanged({ to: user.email, firstName: user.firstName }));
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }

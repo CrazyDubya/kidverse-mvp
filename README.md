@@ -86,6 +86,10 @@ kidverse-mvp/
    npm run dev
    ```
 
+#### Password reset email
+
+Parents who forget their password use "Forgot your password?" on the sign-in page; the backend emails a single-use link that expires after an hour. Set `SMTP_URL` (e.g. `smtps://user:pass@smtp.example.com`), `MAIL_FROM` and `CLIENT_URL` (the public address of the frontend, used to build the link) in `backend/.env`. Without `SMTP_URL`, development prints the email to the backend console and production refuses to send. Children have no email; a parent resets a child's password from the dashboard.
+
 ### Development
 
 - Frontend runs on `http://localhost:3000` and proxies `/api` and `/socket.io` to the backend, so no CORS setup is needed in development

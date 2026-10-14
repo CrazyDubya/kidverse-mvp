@@ -2,8 +2,18 @@
 // run without a MongoDB server. Schema rules are covered separately in models.test.js.
 const mongoose = require('mongoose');
 
+// Equality plus the few operators the routes use ($or, $gt, $lte, $ne, $exists)
 const matches = (doc, filter) =>
-  Object.entries(filter).every(([k, v]) => String(doc[k]) === String(v));
+  Object.entries(filter).every(([k, v]) => {
+    if (k === '$or') return v.some((f) => matches(doc, f));
+    if (v && typeof v === 'object' && !(v instanceof Date) && !v._bsontype) {
+      if ('$gt' in v) return doc[k] != null && doc[k] > v.$gt;
+      if ('$lte' in v) return doc[k] != null && doc[k] <= v.$lte;
+      if ('$ne' in v) return String(doc[k]) !== String(v.$ne);
+      if ('$exists' in v) return (doc[k] !== undefined) === v.$exists;
+    }
+    return String(doc[k]) === String(v);
+  });
 
 const query = (fn) => ({
   select() {
@@ -45,6 +55,16 @@ const makeStore = (extra = {}) => {
           for (const [k, v] of Object.entries(update.$inc)) row[k] = (row[k] || 0) + v;
         }
         return row || null;
+      }),
+    findOneAndUpdate: (filter, update) =>
+      query(() => {
+        const row = rows.find((r) => matches(r, filter));
+        if (!row) return null;
+        const before = { ...row };
+        Object.assign(row, update.$set || {});
+        for (const [k, v] of Object.entries(update.$inc || {})) row[k] = (row[k] || 0) + v;
+        for (const k of Object.keys(update.$unset || {})) delete row[k];
+        return before;
       }),
     async updateOne(filter, update) {
       const row = rows.find((r) => matches(r, filter));
